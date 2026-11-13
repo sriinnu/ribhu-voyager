@@ -20,14 +20,19 @@ import type { GatewayRuntime } from "./api-runtime.js";
 
 const HEARTBEAT_MS = 30_000;
 const MAX_CONTENT = 100_000;
+const AUTH_POLL_MS = 500;
 
 type Client = {
   socket: WebSocket;
+  /** Runtime selected by the connection token; every handler uses this one. */
+  runtime: GatewayRuntime;
   alive: boolean;
   conversationId?: number;
 };
 
 type Live = {
+  /** `${runtimeId}:${conversationId}` — never shared across runtimes. */
+  key: string;
   conversationId: number;
   cursor: number;
   view: ConversationView;
@@ -60,41 +65,95 @@ function candidateToken(request: IncomingMessage, url: URL): string | undefined 
   return url.searchParams.get("token") ?? undefined;
 }
 
-async function authorized(
-  request: IncomingMessage,
-  url: URL,
-  token: string,
-  check?: (candidate: string) => Promise<boolean>,
-): Promise<boolean> {
-  const candidate = candidateToken(request, url);
-  if (!check) {
-    if (token === "") return true;
-    return candidate !== undefined && safeEqual(candidate, token);
-  }
-  if (candidate === undefined) return false;
-  return check(candidate);
-}
+export type GatewayWindow = { min: number; max: number };
 
 export type GatewayOptions = {
+  /** Legacy per-token check used by the default single-runtime resolver. */
   authorizeToken?: (candidate: string) => Promise<boolean>;
+  /**
+   * Resolve the connecting token to its tenant runtime (multi-tenant pool).
+   * Returning `undefined` rejects the upgrade with 401. When omitted, the
+   * positional runtime is used after the legacy shared-token / authorizeToken
+   * check (the default resolver).
+   */
+  resolveRuntime?: (
+    token: string | undefined,
+  ) => Promise<GatewayRuntime | undefined>;
+  /** Wire identity for each runtime's `welcome`. Defaults to the positional info. */
+  infoFor?: (runtime: GatewayRuntime) => ServerInfo;
 };
 
 export function attachGateway(
   server: HttpServer,
-  runtime: GatewayRuntime,
-  info: ServerInfo,
+  runtime: GatewayRuntime | undefined,
+  info: ServerInfo | undefined,
   token: string,
-  window: { min: number; max: number } = { min: 50, max: 100 },
+  window: GatewayWindow = { min: 50, max: 100 },
   options: GatewayOptions = {},
 ): Gateway {
+  void window;
   const wss = new WebSocketServer({
     noServer: true,
     maxPayload: 1_048_576,
   });
   const clients = new Set<Client>();
-  const lives = new Map<number, Live>();
-  let lastAuthRevision = "";
-  const pending = new Map<number, Promise<Live>>();
+  const lives = new Map<string, Live>();
+  const pending = new Map<string, Promise<Live>>();
+  const runtimeKeys = new WeakMap<GatewayRuntime, string>();
+  const authRevisions = new WeakMap<GatewayRuntime, string>();
+  let runtimeSerial = 0;
+
+  /** Stable per-runtime identity; `serverId` plus a process-local suffix. */
+  const runtimeKey = (target: GatewayRuntime): string => {
+    const known = runtimeKeys.get(target);
+    if (known) return known;
+    const key = `${target.serverId ?? "runtime"}#${++runtimeSerial}`;
+    runtimeKeys.set(target, key);
+    return key;
+  };
+
+  const liveKey = (target: GatewayRuntime, conversationId: number): string =>
+    `${runtimeKey(target)}:${conversationId}`;
+
+  const sameRuntime = (a: GatewayRuntime, b: GatewayRuntime): boolean =>
+    a === b || (a.serverId !== undefined && a.serverId === b.serverId);
+
+  const defaultInfo = info;
+  const infoFor =
+    options.infoFor ??
+    ((target: GatewayRuntime): ServerInfo => {
+      void target;
+      if (!defaultInfo) {
+        throw new Error(
+          "attachGateway requires infoFor when no default ServerInfo is passed.",
+        );
+      }
+      return defaultInfo;
+    });
+
+  const defaultRuntime = runtime;
+  const resolveRuntime =
+    options.resolveRuntime ??
+    (async (
+      candidate: string | undefined,
+    ): Promise<GatewayRuntime | undefined> => {
+      if (!defaultRuntime) return undefined;
+      if (options.authorizeToken) {
+        if (candidate === undefined) return undefined;
+        return (await options.authorizeToken(candidate))
+          ? defaultRuntime
+          : undefined;
+      }
+      if (token === "") return defaultRuntime;
+      if (candidate === undefined) return undefined;
+      return safeEqual(candidate, token) ? defaultRuntime : undefined;
+    });
+
+  if (!options.resolveRuntime && (!defaultRuntime || !defaultInfo)) {
+    throw new Error(
+      "attachGateway needs a runtime and ServerInfo (or a resolveRuntime/infoFor pair).",
+    );
+  }
 
   const broadcast = (live: Live, message: ServerMessage) => {
     const payload = JSON.stringify(message);
@@ -103,19 +162,24 @@ export function attachGateway(
     }
   };
 
-  const ensureLive = (conversationId: number): Promise<Live> => {
-    const existing = lives.get(conversationId);
+  const ensureLive = (
+    target: GatewayRuntime,
+    conversationId: number,
+  ): Promise<Live> => {
+    const key = liveKey(target, conversationId);
+    const existing = lives.get(key);
     if (existing) return Promise.resolve(existing);
 
-    const inflight = pending.get(conversationId);
+    const inflight = pending.get(key);
     if (inflight) return inflight;
 
     const created = (async (): Promise<Live> => {
-      const conversation = await runtime.conversation(conversationId);
+      const conversation = await target.conversation(conversationId);
       if (!conversation) throw new Error(`unknown conversation ${conversationId}`);
 
       const initial = await conversation.view();
       const live: Live = {
+        key,
         conversationId,
         cursor: 0,
         view: initial,
@@ -134,24 +198,28 @@ export function attachGateway(
         });
       });
 
-      lives.set(conversationId, live);
+      lives.set(key, live);
       return live;
     })();
 
-    pending.set(conversationId, created);
+    pending.set(key, created);
     void created
       .catch(() => undefined)
-      .finally(() => pending.delete(conversationId));
+      .finally(() => pending.delete(key));
     return created;
   };
 
   const conversationList = async (
+    target: GatewayRuntime,
     includeArchived = false,
   ): Promise<ConversationSummary[]> =>
-    (await runtime.listConversations?.(includeArchived)) ?? [];
+    (await target.listConversations?.(includeArchived)) ?? [];
 
-  const sendConversations = async (socket: WebSocket): Promise<void> => {
-    const all = await conversationList(true);
+  const sendConversations = async (
+    target: GatewayRuntime,
+    socket: WebSocket,
+  ): Promise<void> => {
+    const all = await conversationList(target, true);
     send(socket, {
       t: "conversations",
       items: all.filter((item) => item.archivedAt === undefined),
@@ -159,14 +227,17 @@ export function attachGateway(
     });
   };
 
-  const broadcastConversations = async (): Promise<void> => {
-    const all = await conversationList(true);
+  const broadcastConversations = async (
+    target: GatewayRuntime,
+  ): Promise<void> => {
+    const all = await conversationList(target, true);
     const payload = JSON.stringify({
       t: "conversations",
       items: all.filter((item) => item.archivedAt === undefined),
       archived: all.filter((item) => item.archivedAt !== undefined),
     } satisfies ServerMessage);
     for (const client of clients) {
+      if (!sameRuntime(client.runtime, target)) continue;
       if (client.socket.readyState === WebSocket.OPEN) client.socket.send(payload);
     }
   };
@@ -175,26 +246,27 @@ export function attachGateway(
     client: Client,
     conversationId?: number,
   ): Promise<boolean> => {
-    const conversation = await runtime.conversation(conversationId);
+    const target = client.runtime;
+    const conversation = await target.conversation(conversationId);
     if (!conversation) return false;
     detach(client);
-    const live = await ensureLive(conversation.id);
+    const live = await ensureLive(target, conversation.id);
     live.view = await conversation.view();
     live.clients.add(client);
     client.conversationId = conversation.id;
-    const auth = runtime.auth ? await runtime.auth.info() : undefined;
+    const auth = target.auth ? await target.auth.info() : undefined;
     send(client.socket, {
       t: "welcome",
       v: PROTOCOL_VERSION,
       info: {
-        ...info,
+        ...infoFor(target),
         ...(auth ? { auth } : {}),
       },
       conversationId: conversation.id,
       cursor: live.cursor,
       view: live.view as unknown as WireView,
     });
-    await sendConversations(client.socket);
+    await sendConversations(target, client.socket);
     return true;
   };
 
@@ -211,12 +283,13 @@ export function attachGateway(
 
   const detach = (client: Client) => {
     if (!client.conversationId) return;
-    const live = lives.get(client.conversationId);
+    const key = liveKey(client.runtime, client.conversationId);
+    const live = lives.get(key);
     if (live) {
       live.clients.delete(client);
       if (live.clients.size === 0) {
         live.unsubscribe();
-        lives.delete(live.conversationId);
+        lives.delete(key);
       }
     }
     client.conversationId = undefined;
@@ -224,6 +297,7 @@ export function attachGateway(
 
   const handle = async (client: Client, message: ClientMessage) => {
     const socket = client.socket;
+    const runtime = client.runtime;
 
     switch (message.t) {
       case "hello": {
@@ -268,7 +342,7 @@ export function attachGateway(
           });
           return;
         }
-        await broadcastConversations();
+        await broadcastConversations(runtime);
         return;
       }
 
@@ -278,6 +352,16 @@ export function attachGateway(
             t: "error",
             code: "server_error",
             message: "Forking is not available.",
+          });
+          return;
+        }
+        // The parent must belong to this client's runtime (tenant).
+        const parent = await runtime.conversation(message.conversationId);
+        if (!parent) {
+          send(socket, {
+            t: "error",
+            code: "unknown_conversation",
+            message: "That conversation does not exist.",
           });
           return;
         }
@@ -293,7 +377,7 @@ export function attachGateway(
           });
           return;
         }
-        await broadcastConversations();
+        await broadcastConversations(runtime);
         return;
       }
 
@@ -414,8 +498,17 @@ export function attachGateway(
           });
           return;
         }
+        const conversation = await runtime.conversation(message.conversationId);
+        if (!conversation) {
+          send(socket, {
+            t: "error",
+            code: "unknown_conversation",
+            message: "That conversation does not exist.",
+          });
+          return;
+        }
         await runtime.renameConversation(message.conversationId, message.title);
-        await broadcastConversations();
+        await broadcastConversations(runtime);
         return;
       }
 
@@ -515,6 +608,8 @@ export function attachGateway(
       }
 
       case "resync": {
+        // Resolved against the client's own runtime: a foreign tenant id is
+        // simply an unknown conversation here.
         const conversation = await runtime.conversation(message.conversationId);
         if (!conversation) {
           send(socket, {
@@ -524,7 +619,7 @@ export function attachGateway(
           });
           return;
         }
-        const live = await ensureLive(conversation.id);
+        const live = await ensureLive(runtime, conversation.id);
         send(socket, snapshot(live, "request"));
         return;
       }
@@ -566,11 +661,20 @@ export function attachGateway(
           });
           return;
         }
+        const conversation = await runtime.conversation(message.conversationId);
+        if (!conversation) {
+          send(socket, {
+            t: "error",
+            code: "unknown_conversation",
+            message: "That conversation does not exist.",
+          });
+          return;
+        }
         await runtime.archiveConversation(
           message.conversationId,
           message.archived === true,
         );
-        await broadcastConversations();
+        await broadcastConversations(runtime);
         return;
       }
 
@@ -595,6 +699,7 @@ export function attachGateway(
           const auth = await runtime.auth.setMode(message.mode);
           const payload = JSON.stringify({ t: "auth", auth } satisfies ServerMessage);
           for (const peer of clients) {
+            if (!sameRuntime(peer.runtime, runtime)) continue;
             if (peer.socket.readyState === WebSocket.OPEN) {
               peer.socket.send(payload);
             }
@@ -619,8 +724,12 @@ export function attachGateway(
     }
   };
 
-  wss.on("connection", (socket: WebSocket) => {
-    const client: Client = { socket, alive: true };
+  const startClient = (socket: WebSocket, clientRuntime: GatewayRuntime) => {
+    const client: Client = {
+      socket,
+      alive: true,
+      runtime: clientRuntime,
+    };
     clients.add(client);
 
     socket.on("pong", () => {
@@ -657,7 +766,7 @@ export function attachGateway(
       detach(client);
       clients.delete(client);
     });
-  });
+  };
 
   server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
     let url: URL;
@@ -673,13 +782,14 @@ export function attachGateway(
     }
     void (async () => {
       try {
-        if (!(await authorized(request, url, token, options.authorizeToken))) {
+        const resolved = await resolveRuntime(candidateToken(request, url));
+        if (!resolved) {
           socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
           socket.destroy();
           return;
         }
         wss.handleUpgrade(request, socket, head, (ws) => {
-          wss.emit("connection", ws, request);
+          startClient(ws, resolved);
         });
       } catch (error) {
         console.error("auth check failed", error);
@@ -691,22 +801,30 @@ export function attachGateway(
 
   const authTimer = setInterval(() => {
     void (async () => {
-      try {
-        const revision =
-          (await runtime.storage?.getSetting("auth_revision")) ?? "";
-      if (revision === "" || revision === lastAuthRevision) return;
-      lastAuthRevision = revision;
-      const auth = (await runtime.authInfo?.()) ?? (await runtime.auth?.info());
-      if (!auth) return;
-      const payload = JSON.stringify({ t: "auth", auth } satisfies ServerMessage);
-        for (const client of clients) {
-          if (client.socket.readyState === WebSocket.OPEN) client.socket.send(payload);
+      const runtimes = new Set<GatewayRuntime>();
+      for (const client of clients) runtimes.add(client.runtime);
+      for (const target of runtimes) {
+        try {
+          const revision =
+            (await target.storage?.getSetting("auth_revision")) ?? "";
+          if (revision === "" || revision === authRevisions.get(target)) continue;
+          authRevisions.set(target, revision);
+          const auth =
+            (await target.authInfo?.()) ?? (await target.auth?.info());
+          if (!auth) continue;
+          const payload = JSON.stringify({ t: "auth", auth } satisfies ServerMessage);
+          for (const client of clients) {
+            if (!sameRuntime(client.runtime, target)) continue;
+            if (client.socket.readyState === WebSocket.OPEN) {
+              client.socket.send(payload);
+            }
+          }
+        } catch (error) {
+          console.error("auth broadcast failed", error);
         }
-      } catch (error) {
-        console.error("auth broadcast failed", error);
       }
     })();
-  }, 500);
+  }, AUTH_POLL_MS);
   authTimer.unref?.();
 
   const heartbeat = setInterval(() => {
@@ -731,6 +849,7 @@ export function attachGateway(
         live.unsubscribe();
       }
       lives.clear();
+      pending.clear();
       for (const client of clients) client.socket.close(1001, "server shutting down");
       clients.clear();
       await new Promise<void>((resolve) => wss.close(() => resolve()));

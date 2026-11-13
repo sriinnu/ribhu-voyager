@@ -1,10 +1,10 @@
-import { timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { networkInterfaces } from "node:os";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 
-import type { ServerInfo } from "@ribhu-voyager/protocol";
+import { PROTOCOL_VERSION } from "@ribhu-voyager/protocol";
+import type { IncomingMessage } from "node:http";
 
 import { describeConfig, loadConfig } from "./config.js";
 import { attachGateway } from "./gateway.js";
@@ -13,8 +13,9 @@ import {
   resolveApiToken,
 } from "@ribhu-voyager/storage-postgres";
 
-import { createApiRuntime } from "./api-runtime.js";
+import type { ApiRuntime } from "./api-runtime.js";
 import { healthPayload } from "./health.js";
+import { createRuntimePool } from "./runtime-pool.js";
 import { createStaticHandler } from "./static.js";
 
 const color = {
@@ -35,16 +36,26 @@ function lanAddresses(): string[] {
   return found;
 }
 
-const config = loadConfig();
-const runtime = await createApiRuntime(config);
+function requestToken(request: IncomingMessage, url: URL): string | undefined {
+  const header = request.headers.authorization;
+  if (typeof header === "string" && header.startsWith("Bearer ")) {
+    return header.slice("Bearer ".length);
+  }
+  return url.searchParams.get("token") ?? undefined;
+}
 
-const info: ServerInfo = {
-  serverId: runtime.serverId,
-  demo: runtime.demo,
-  model: runtime.model.modelId,
-  provider: runtime.model.provider,
-  startedAt: runtime.startedAt,
-};
+const config = loadConfig();
+const startedAt = Date.now();
+const hasTenantTokens = config.storage === "postgres" && Boolean(config.postgresUrl);
+
+// Postgres tokens resolve to their tenant; SQLite/local has one default runtime
+// guarded by the shared RIBBHU_TOKEN.
+const pool = createRuntimePool(
+  config,
+  hasTenantTokens
+    ? (token: string) => resolveApiToken(config.postgresUrl!, token)
+    : undefined,
+);
 
 const distDir = resolve(fileURLToPath(new URL("../../mobile/dist/", import.meta.url)));
 const serveStatic = createStaticHandler(distDir);
@@ -54,24 +65,21 @@ const server = createServer((request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
 
     if (url.pathname === "/api/health") {
-      let detailed = !config.token && !tokenCheck;
-      if (!detailed) {
-        const header = request.headers.authorization;
-        const candidate =
-          typeof header === "string" && header.startsWith("Bearer ")
-            ? header.slice("Bearer ".length)
-            : url.searchParams.get("token");
-        if (candidate) {
-          detailed = tokenCheck
-            ? await tokenCheck(candidate).catch(() => false)
-            : sameToken(candidate, config.token);
-        }
-      }
+      // Authenticated callers get their tenant's detailed health; unknown or
+      // missing tokens get only the minimal public payload.
+      const resolved = await pool.resolve(requestToken(request, url));
+      const payload = resolved
+        ? await healthPayload(resolved.runtime, true)
+        : {
+            ok: true,
+            protocol: PROTOCOL_VERSION,
+            uptimeMs: Date.now() - startedAt,
+          };
       response.writeHead(200, {
         "content-type": "application/json; charset=utf-8",
         "cache-control": "no-store",
       });
-      response.end(JSON.stringify(await healthPayload(runtime, detailed)));
+      response.end(JSON.stringify(payload));
       return;
     }
 
@@ -89,23 +97,9 @@ const server = createServer((request, response) => {
   });
 });
 
-function sameToken(left: string, right: string): boolean {
-  const a = Buffer.from(left);
-  const b = Buffer.from(right);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
-const tokenCheck =
-  config.storage === "postgres" && config.postgresUrl
-    ? async (candidate: string) => {
-        const tenant = await resolveApiToken(config.postgresUrl!, candidate);
-        return tenant === (config.tenantId ?? "default");
-      }
-    : undefined;
-
 if (
   !config.token &&
-  !tokenCheck &&
+  !hasTenantTokens &&
   config.host !== "127.0.0.1" &&
   config.host !== "::1" &&
   config.host !== "localhost"
@@ -118,21 +112,24 @@ if (
 
 const gateway = attachGateway(
   server,
-  runtime,
-  info,
+  undefined,
+  undefined,
   config.token,
   {
     min: 50,
     max: Math.max(config.maxWindowEntries, 50),
   },
-  tokenCheck ? { authorizeToken: tokenCheck } : {},
+  {
+    resolveRuntime: async (token) => (await pool.resolve(token))?.runtime,
+    infoFor: (runtime) => pool.infoFor(runtime as ApiRuntime),
+  },
 );
 
 const shutdown = async (signal: string) => {
   console.log(`\n${color.dim}${signal} — closing storage…${color.reset}`);
   try {
     await gateway.close();
-    await runtime.close();
+    await pool.close();
     await closeApiTokenPools();
   } finally {
     server.close();
@@ -171,6 +168,6 @@ server.listen(config.port, config.host, () => {
     );
   }
   console.log(
-    `${color.dim}  data      durable SQLite storage — kill this process and the conversation resumes${color.reset}\n`,
+    `${color.dim}  data      durable storage — kill this process and the conversation resumes${color.reset}\n`,
   );
 });

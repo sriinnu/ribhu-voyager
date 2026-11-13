@@ -411,7 +411,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 ## Tests and development
 
 ```bash
-npm test          # 71 tests
+npm test          # 74 tests
 npm run typecheck
 npm run build
 npm run dev
@@ -491,9 +491,9 @@ next step. See [docs/ARCHITECTURE-UPGRADE.md](docs/ARCHITECTURE-UPGRADE.md) and 
 
 - **Sandboxing is opt-in.** `RIBBHU_SANDBOX=local` is the default; local `bash` runs as your user
   (with a secret-scrubbed environment). Use `RIBBHU_SANDBOX=docker` for isolation.
-- **One tenant per deployment.** Postgres RLS isolates tenants in one database, and tenant tokens are
-  checked at the WebSocket boundary, but a single API process does not route connections to different
-  tenant runtimes. Use one deployment (or one worker/API pair) per tenant.
+- **Multi-tenant API, one worker per tenant.** One API process routes tenant tokens to isolated
+  runtimes; workers still bind to `RIBBHU_TENANT`, and there is no worker autoscaler or shared worker
+  pool. See [docs/MULTI-TENANT.md](docs/MULTI-TENANT.md).
 - **RLS requires the right role.** A superuser or `BYPASSRLS` role silently bypasses row security.
   Provision a dedicated `NOSUPERUSER NOBYPASSRLS` app role.
 - **Approvals are single-user and non-cryptographic.** `ask` pauses risky tools, survives restart, and

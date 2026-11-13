@@ -55,6 +55,8 @@ export type GatewayAuth = {
 };
 
 export type GatewayRuntime = {
+  /** Stable identity used by the gateway to scope per-runtime state. */
+  readonly serverId?: string;
   conversation(id?: number): Promise<GatewayConversation | undefined>;
   auth?: GatewayAuth;
   storage?: { getSetting(key: string): Awaitable<string | undefined> };
@@ -82,11 +84,15 @@ export type ApiRuntime = GatewayRuntime & {
   close(): Promise<void>;
 };
 
-export async function createApiRuntime(config: Config): Promise<ApiRuntime> {
+export async function createApiRuntime(
+  config: Config,
+  tenantId?: string,
+): Promise<ApiRuntime> {
   await mkdir(config.dataDir, { recursive: true });
+  const tenant = tenantId ?? config.tenantId ?? "default";
   const storage: Storage =
     config.storage === "postgres" && config.postgresUrl
-      ? new PostgresStorage(config.postgresUrl, config.tenantId ?? "default")
+      ? new PostgresStorage(config.postgresUrl, tenant)
       : serializedStorage(new Db(join(config.dataDir, "ribhu.sqlite")));
   if (storage instanceof PostgresStorage) await storage.init();
   const rootId = await storage.ensureRoot();

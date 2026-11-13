@@ -84,8 +84,8 @@ npm start
 - The shared `RIBBHU_TOKEN` is ignored when Postgres token checking is active; use the issued token.
 - Keep `HOST=127.0.0.1` and put TLS in front. Do not expose cleartext `0.0.0.0`.
 - `RIBBHU_SANDBOX=docker` and a restrictive approval policy are strongly recommended for hosted use.
-- One API/worker pair per tenant is the supported model. Postgres supports multiple workers, but
-  there is no token → runtime routing yet.
+- The API process can serve multiple tenants (see [MULTI-TENANT.md](MULTI-TENANT.md)); run one worker
+  per tenant. There is no worker autoscaler or shared worker pool.
 
 ## 5. TLS reverse proxy
 
@@ -129,7 +129,7 @@ the browser. WebSocket upgrades use the same origin.
 - [ ] Backup + restore tested
 - [ ] `RIBBHU_SANDBOX=docker` and approval policy set
 - [ ] Authenticated health checked from outside the host
-- [ ] One tenant per deployment documented for operators
+- [ ] Worker-per-tenant topology documented for operators
 
 ## Known limits
 
