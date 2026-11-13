@@ -1,0 +1,1400 @@
+import { admitSubmission } from "./admission.js";
+import { seedConversation } from "./conversation.js";
+import { LeaseLost } from "./errors.js";
+import type { Awaitable, Storage, ToolRunner, ToolTaskRow } from "./ports.js";
+import type {
+  ApprovalsMode,
+  AssistantContent,
+  AssistantMessage,
+  ConversationView,
+  EntryRecord,
+  JsonObject,
+  ModelMessage,
+  ModelRef,
+  Provider,
+  SubmissionDraft,
+  SubmissionInfo,
+  ToolContext,
+  ToolResult,
+  Usage,
+} from "./types.js";
+import { emptyUsage } from "./types.js";
+
+type ToolSlot = {
+  callId: string;
+  name: string;
+  status: "pending" | "running" | "done";
+  output?: string;
+};
+
+type LiveState = {
+  run?: { inputs: number[]; turns: number };
+  generation?: { attempt: number; message?: AssistantMessage };
+  tools?: ToolSlot[];
+  runFailure?: { reason: string; detail?: string };
+};
+
+/** Tools that pause for interactive approval when `approvals` is `"ask"`. */
+const APPROVAL_TOOLS = new Set(["bash", "write", "edit"]);
+/** How often a waiting turn re-reads the journal for a decision. */
+const APPROVAL_POLL_MS = 300;
+/** An unanswered request is treated as denied after this long. */
+const APPROVAL_TIMEOUT_MS = 5 * 60_000;
+
+type ApprovalState = {
+  status: "pending" | "approved" | "denied";
+  requestedAt?: number;
+};
+
+type ApprovalOutcome = "approved" | "denied" | "timeout";
+
+function abortError(): DOMException {
+  return new DOMException("Aborted", "AbortError");
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function sleepWithSignal(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError());
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export type EngineOptions = {
+  storage: Storage;
+  provider: Provider;
+  runner: ToolRunner;
+  cwd: string;
+  model: ModelRef;
+  instructions: string;
+  maxWindowEntries?: number;
+  maxTurns?: number;
+  compactionThresholdChars?: number;
+  compactionKeepEntries?: number;
+  /** Tool policy. `ask` pauses before bash/write/edit for a journaled decision. */
+  approvals?: ApprovalsMode;
+  /** Start pending runs on open. Workers set false and run only claimed jobs. */
+  autoRun?: boolean;
+  recoverOnOpen?: boolean;
+  log?: (message: string) => void;
+};
+
+type ViewListener = (view: ConversationView, cursor: number) => void;
+
+export class Conversation {
+  constructor(
+    readonly engine: Engine,
+    readonly id: number,
+  ) {}
+
+  submit(draft: SubmissionDraft): Promise<SubmissionInfo> {
+    return this.engine.submit(this.id, draft);
+  }
+
+  compact(): Promise<number | undefined> {
+    return this.engine.compact(this.id);
+  }
+
+  abort(): Promise<void> {
+    return this.engine.abort(this.id);
+  }
+
+  /** Approve or deny an `ask`-mode tool call by its model call id. */
+  decideApproval(callId: string, approved: boolean): Promise<boolean> {
+    return this.engine.decideApproval(this.id, callId, approved);
+  }
+
+  view(): Promise<ConversationView> {
+    return this.engine.view(this.id);
+  }
+
+  async watch(
+    listener: ViewListener,
+  ): Promise<() => void> {
+    return this.engine.subscribe(this.id, listener);
+  }
+
+  waitForIdle(timeoutMs = 60_000): Promise<void> {
+    return this.engine.waitForIdle(this.id, timeoutMs);
+  }
+}
+
+export class Engine {
+  private readonly storage: Storage;
+  private readonly provider: Provider;
+  private readonly runner: ToolRunner;
+  private readonly cwd: string;
+  private readonly model: ModelRef;
+  private readonly instructions: string;
+  private readonly maxWindowEntries: number;
+  private readonly maxTurns: number;
+  private readonly compactionThresholdChars: number;
+  private readonly compactionKeepEntries: number;
+  private readonly approvals: ApprovalsMode;
+  private readonly autoRun: boolean;
+  private readonly recoverOnOpen: boolean;
+  private readonly log: (message: string) => void;
+
+  private readonly listeners = new Map<number, Set<ViewListener>>();
+  private readonly running = new Set<number>();
+  private readonly aborts = new Map<number, AbortController>();
+  private readonly live = new Map<number, LiveState>();
+  private readonly cursors = new Map<number, number>();
+  private readonly emitTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  private readonly lastEmit = new Map<number, number>();
+  private readonly leaseLost = new Set<number>();
+  private readonly pendingEmits = new Set<Promise<void>>();
+  private closed = false;
+
+  private constructor(options: EngineOptions) {
+    this.storage = options.storage;
+    this.provider = options.provider;
+    this.runner = options.runner;
+    this.cwd = options.cwd;
+    this.model = options.model;
+    this.instructions = options.instructions;
+    this.maxWindowEntries = options.maxWindowEntries ?? 100;
+    this.maxTurns = options.maxTurns ?? 24;
+    this.compactionThresholdChars = options.compactionThresholdChars ?? 240_000;
+    this.compactionKeepEntries = options.compactionKeepEntries ?? 12;
+    this.approvals = options.approvals ?? "allow";
+    this.autoRun = options.autoRun ?? true;
+    this.recoverOnOpen = options.recoverOnOpen ?? true;
+    this.log = options.log ?? (() => undefined);
+  }
+
+  static async open(options: EngineOptions): Promise<Engine> {
+    const engine = new Engine(options);
+    const rootId = await engine.storage.ensureRoot();
+    await seedConversation(engine.storage, rootId, engine.model);
+    await engine.resume();
+    return engine;
+  }
+
+  async root(): Promise<Conversation> {
+    return new Conversation(this, await this.storage.ensureRoot());
+  }
+
+  async compact(
+    conversationId: number,
+    signal: AbortSignal = new AbortController().signal,
+    isLeaseValid?: () => Awaitable<boolean>,
+  ): Promise<number | undefined> {
+    if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+    const { entries } = await this.storage.entries(
+      conversationId,
+      this.maxWindowEntries,
+    );
+    const keep = Math.min(this.compactionKeepEntries, entries.length - 1);
+    if (keep < 1) return undefined;
+    const cutoff = entries[entries.length - keep - 1];
+    if (!cutoff) return undefined;
+    const messages: ModelMessage[] = [];
+    for (const entry of entries) {
+      if (entry.id > cutoff.id) break;
+      if (entry.kind === "pi.compaction") continue;
+      if (entry.model) messages.push(...entry.model);
+    }
+    if (messages.length === 0) return undefined;
+
+    let summary = "";
+    for await (const event of this.provider.stream({
+      model: this.model.modelId,
+      system:
+        "Summarize this coding-agent conversation for an agent that must continue it. " +
+        "Preserve goals, decisions, files changed, commands and test results, open issues, " +
+        "and exact identifiers. Be concise but complete.",
+      messages,
+      tools: [],
+      maxTokens: 2048,
+      signal,
+    })) {
+      if (event.type === "text") summary += event.text;
+    }
+    summary = summary.trim();
+    if (summary === "") return undefined;
+    if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+
+    const entryId = await this.storage.tx(async () =>
+      await this.storage.appendEntry({
+        conversationId,
+        kind: "pi.compaction",
+        data: {
+          summary: summary.slice(0, 16_000),
+          coversUpTo: cutoff.id,
+        },
+      }),
+    );
+    await this.emit(conversationId);
+    this.log(
+      `compacted conversation=${conversationId} upTo=${cutoff.id} entry=${entryId}`,
+    );
+    return entryId;
+  }
+
+  async listConversations() {
+    return await this.storage.listConversations();
+  }
+
+  async createConversation(title?: string): Promise<Conversation> {
+    const id = await this.storage.createConversation(title);
+    await seedConversation(this.storage, id, this.model);
+    return new Conversation(this, id);
+  }
+
+  async forkConversation(
+    parentId: number,
+    atEntryId?: number,
+  ): Promise<Conversation> {
+    const id = await this.storage.forkConversation(parentId, atEntryId);
+    await seedConversation(this.storage, id, this.model);
+    return new Conversation(this, id);
+  }
+
+  async renameConversation(id: number, title: string): Promise<void> {
+    await this.storage.renameConversation(id, title);
+  }
+
+  async conversation(id: number): Promise<Conversation | undefined> {
+    return await this.storage.conversationExists(id) ? new Conversation(this, id) : undefined;
+  }
+
+  async waitForIdle(conversationId: number, timeoutMs = 60_000): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (!this.running.has(conversationId) && !await this.storage.busy(conversationId)) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    throw new Error("timed out waiting for the conversation to become idle");
+  }
+
+  abortAll(): void {
+    for (const controller of this.aborts.values()) controller.abort();
+  }
+
+  loseLease(conversationId: number): void {
+    this.leaseLost.add(conversationId);
+    this.aborts.get(conversationId)?.abort();
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.abortAll();
+    for (const timer of this.emitTimers.values()) clearTimeout(timer);
+    this.emitTimers.clear();
+    const deadline = Date.now() + 15_000;
+    while (this.running.size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await Promise.allSettled([...this.pendingEmits]);
+    await this.storage.close();
+  }
+
+  async submit(conversationId: number, draft: SubmissionDraft): Promise<SubmissionInfo> {
+    const submission = await admitSubmission(this.storage, conversationId, draft);
+    void this.run(conversationId).catch(() => undefined);
+    return submission;
+  }
+
+  async abort(conversationId: number): Promise<void> {
+    const open = await this.storage.queuedSubmissions(conversationId);
+    await this.storage.settleSubmissionIds(
+      open.map((row) => row.id),
+      "aborted",
+    );
+    for (const task of await this.storage.runningToolTasks(conversationId)) {
+      await this.storage.finishToolTask(task.id, "Interrupted by user.", "aborted");
+    }
+    this.aborts.get(conversationId)?.abort();
+    const live = this.live.get(conversationId);
+    if (live) {
+      live.run = undefined;
+      live.generation = undefined;
+      live.tools = undefined;
+    }
+    await this.emit(conversationId);
+  }
+
+  /**
+   * Approve or deny a pending `ask`-mode tool call. The decision is journaled
+   * as a `pi.approval` entry (the newest entry wins) and the waiting run picks
+   * it up on its next poll. Returns false when there is nothing pending.
+   */
+  async decideApproval(
+    conversationId: number,
+    callId: string,
+    approved: boolean,
+  ): Promise<boolean> {
+    if (!(await this.storage.conversationExists(conversationId))) return false;
+    const latest = await this.latestApproval(conversationId, callId);
+    if (latest?.status !== "pending") return false;
+    await this.storage.tx(async () => {
+      await this.storage.appendEntry({
+        conversationId,
+        kind: "pi.approval",
+        data: {
+          callId,
+          status: approved ? "approved" : "denied",
+          decidedAt: Date.now(),
+        },
+      });
+    });
+    this.log(
+      `approval ${approved ? "approved" : "denied"} conversation=${conversationId} call=${callId}`,
+    );
+    return true;
+  }
+
+  async view(conversationId: number): Promise<ConversationView> {
+    if (!await this.storage.conversationExists(conversationId)) {
+      return { conversation: { id: conversationId }, entries: [], docs: {} };
+    }
+    const view = await this.storage.view(conversationId, this.maxWindowEntries);
+    const live = this.live.get(conversationId);
+    if (live) {
+      const value: JsonObject = {
+        ...(live.run
+          ? { run: { inputs: live.run.inputs, turns: live.run.turns } }
+          : {}),
+        ...(live.generation
+          ? {
+              generation: {
+                attempt: live.generation.attempt,
+                ...(live.generation.message
+                  ? { message: live.generation.message as unknown as JsonObject }
+                  : {}),
+              },
+            }
+          : {}),
+        ...(live.tools ? { tools: live.tools as unknown as JsonObject } : {}),
+        ...(live.runFailure
+          ? { runFailure: live.runFailure as unknown as JsonObject }
+          : {}),
+      };
+      view.docs["pi.live"] = value;
+    }
+    return view;
+  }
+
+  async subscribe(
+    conversationId: number,
+    listener: ViewListener,
+  ): Promise<() => void> {
+    const set = this.listeners.get(conversationId) ?? new Set<ViewListener>();
+    set.add(listener);
+    this.listeners.set(conversationId, set);
+    listener(await this.view(conversationId), this.cursors.get(conversationId) ?? 0);
+    return () => {
+      set.delete(listener);
+      if (set.size === 0) this.listeners.delete(conversationId);
+    };
+  }
+
+  async resume(): Promise<void> {
+    // Finish any tool that was executing when the process died. Workers set
+    // recoverOnOpen=false and recover only after claiming the conversation.
+    if (this.recoverOnOpen) {
+      for (const task of await this.storage.runningToolTasks()) {
+        // A pending ask-mode request is a durable wait: the run loop re-enters
+        // it with abort/lease checks instead of blocking engine startup here.
+        if (this.requiresApproval(task.name)) continue;
+        await this.recoverToolTask(task);
+      }
+    }
+    // Restart any conversation with open work.
+    const ids = new Set(await this.storage.conversationIdsWithOpenWork());
+    for (const id of ids) {
+      if (this.autoRun) {
+        void this.run(id).catch(() => undefined);
+      } else {
+        await this.storage.enqueueRun(id);
+      }
+    }
+  }
+
+  async recoverConversation(
+    conversationId: number,
+    isLeaseValid?: () => Awaitable<boolean>,
+  ): Promise<void> {
+    const tasks = await this.storage.runningToolTasks(conversationId);
+    if (tasks.length === 0) return;
+    // Share the run's abort controller when one exists so stop/close reaches
+    // a recovery wait too.
+    const owned = !this.aborts.has(conversationId);
+    const controller = this.aborts.get(conversationId) ?? new AbortController();
+    if (owned) this.aborts.set(conversationId, controller);
+    let interrupted: unknown;
+    try {
+      for (const task of tasks) {
+        await this.recoverToolTask(task, controller.signal, isLeaseValid);
+      }
+    } catch (error) {
+      if (!isAbortError(error)) throw error;
+      interrupted = error;
+    } finally {
+      if (owned && this.aborts.get(conversationId) === controller) {
+        this.aborts.delete(conversationId);
+      }
+    }
+    if (interrupted !== undefined) {
+      // A cancel or shutdown interrupted the durable wait: settle it as aborted.
+      await this.abort(conversationId).catch(() => undefined);
+      throw interrupted;
+    }
+  }
+
+  private async recoverToolTask(
+    task: ToolTaskRow,
+    signal?: AbortSignal,
+    isLeaseValid?: () => Awaitable<boolean>,
+  ): Promise<void> {
+    if (await this.storage.hasToolResult(task.conversation_id, task.call_id)) {
+      await this.storage.finishToolTask(task.id, "result already journaled", "done");
+      return;
+    }
+
+    let args: JsonObject = {};
+    try {
+      const parsed = JSON.parse(task.args) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        args = parsed as JsonObject;
+      }
+    } catch {
+      /* use empty args */
+    }
+
+    const spec = this.runner.specs.find((entry) => entry.name === task.name);
+    if (spec && this.requiresApproval(task.name)) {
+      // Request and decision are journal entries: re-enter the wait instead of
+      // reporting an interruption. Approved -> execute; denied -> tool error.
+      const decision = await this.awaitApproval(
+        task.conversation_id,
+        { id: task.call_id, name: task.name, arguments: args },
+        {
+          signal: signal ?? new AbortController().signal,
+          ...(isLeaseValid ? { isLeaseValid } : {}),
+          watchCancel: true,
+        },
+      );
+      if (decision !== "approved") {
+        await this.journalApprovalDenial(task, decision);
+        await this.emit(task.conversation_id);
+        return;
+      }
+    } else if (!spec || spec.replaySafe === false) {
+      await this.storage.tx(async () => {
+        await this.storage.appendEntry({
+          conversationId: task.conversation_id,
+          kind: "pi.tool-result",
+          byTaskId: task.id,
+          model: [
+            {
+              role: "toolResult",
+              toolCallId: task.call_id,
+              toolName: task.name,
+              content:
+                "Interrupted: the gateway restarted while this tool was running. It was not re-run because it is not replay-safe.",
+              isError: true,
+              timestamp: Date.now(),
+            },
+          ],
+        });
+        await this.storage.finishToolTask(task.id, "interrupted", "aborted");
+      });
+      await this.emit(task.conversation_id);
+      return;
+    }
+
+    if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+    this.log(
+      `resuming ${this.requiresApproval(task.name) ? "approved" : "replay-safe"} tool ${task.name}`,
+    );
+    const controller = new AbortController();
+    const executionSignal = signal ?? controller.signal;
+    try {
+      const result = await this.runner.execute(task.name, args, {
+        cwd: this.cwd,
+        signal: executionSignal,
+        output: () => undefined,
+        taskId: task.id,
+      });
+      await this.storage.tx(async () => {
+        await this.storage.appendEntry({
+          conversationId: task.conversation_id,
+          kind: "pi.tool-result",
+          byTaskId: task.id,
+          model: [
+            {
+              role: "toolResult",
+              toolCallId: task.call_id,
+              toolName: task.name,
+              content: result.content,
+              isError: result.isError === true,
+              timestamp: Date.now(),
+            },
+          ],
+        });
+        await this.storage.finishToolTask(task.id, result.content, result.isError ? "failed" : "done");
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const aborted = executionSignal.aborted;
+      await this.storage.tx(async () => {
+        await this.storage.appendEntry({
+          conversationId: task.conversation_id,
+          kind: "pi.tool-result",
+          byTaskId: task.id,
+          model: [
+            {
+              role: "toolResult",
+              toolCallId: task.call_id,
+              toolName: task.name,
+              content: aborted
+                ? "Interrupted by user."
+                : `Interrupted tool failed on resume: ${message}`,
+              isError: true,
+              timestamp: Date.now(),
+            },
+          ],
+        });
+        await this.storage.finishToolTask(
+          task.id,
+          message,
+          aborted ? "aborted" : "failed",
+        );
+      });
+      if (aborted) throw abortError();
+    }
+    await this.emit(task.conversation_id);
+  }
+
+  async run(
+    conversationId: number,
+    isLeaseValid?: () => Awaitable<boolean>,
+  ): Promise<void> {
+    if (this.closed || this.running.has(conversationId)) return;
+    if (!await this.storage.conversationExists(conversationId)) return;
+
+    const initial = await this.storage.queuedSubmissions(conversationId);
+    const pendingAtStart = await this.pendingToolCalls(conversationId);
+    if (initial.length === 0 && pendingAtStart.length === 0) {
+      await this.storage.clearCancel(conversationId);
+      return;
+    }
+
+    this.running.add(conversationId);
+    // A cancel flag from an idle Stop must not poison this run.
+    await this.storage.clearCancel(conversationId);
+    const controller = new AbortController();
+    this.aborts.set(conversationId, controller);
+    const cancelTimer = setInterval(() => {
+      void (async () => {
+        try {
+          if (await this.storage.isCancelRequested(conversationId)) {
+            controller.abort();
+          }
+        } catch {
+          /* storage is closing */
+        }
+      })();
+    }, 200);
+    const inputIds = initial.map((row) => row.id);
+    // Only a run that was already in flight can reuse a committed final answer.
+    // A freshly queued follow-up must call the model even if the previous
+    // answer is the last journal entry.
+    const resumed = initial.length > 0 && initial.every((row) => row.status === "running");
+    const adoptSteering = async () => {
+      for (const submission of await this.storage.queuedSubmissions(conversationId)) {
+        if (submission.status !== "queued" || submission.when_busy !== "steer") {
+          continue;
+        }
+        if (inputIds.includes(submission.id)) continue;
+        await this.storage.updateSubmission(submission.id, "running");
+        inputIds.push(submission.id);
+      }
+    };
+    this.log(`run conversation=${conversationId} inputs=${inputIds.join(",")}`);
+    for (const id of inputIds) await this.storage.updateSubmission(id, "running");
+    const live: LiveState = { run: { inputs: inputIds, turns: 0 } };
+    this.live.set(conversationId, live);
+    let failed: string | undefined;
+    let settled = false;
+    let lostLease = false;
+    let compactedThisRun = false;
+
+    try {
+      for (let turn = 0; turn < this.maxTurns; turn += 1) {
+        if (controller.signal.aborted) break;
+        if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+        await adoptSteering();
+
+        if (!compactedThisRun && this.compactionThresholdChars > 0) {
+          compactedThisRun = true;
+          const context = await this.contextMessages(
+            conversationId,
+            new Set(inputIds),
+          );
+          const chars = context.reduce(
+            (sum, message) => sum + JSON.stringify(message).length,
+            0,
+          );
+          if (chars > this.compactionThresholdChars) {
+            try {
+              await this.compact(conversationId, controller.signal);
+            } catch (error) {
+              this.log(
+                `compaction failed: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+          }
+        }
+
+        const pending = await this.pendingToolCalls(conversationId);
+        if (pending.length > 0) {
+          for (const call of pending) {
+            if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+            await this.executeTool(
+              conversationId,
+              call,
+              controller.signal,
+              live,
+              isLeaseValid,
+            );
+          }
+          continue;
+        }
+
+        const last = await this.storage.lastEntry(conversationId);
+        if (!last || inputIds.length === 0) break;
+
+        // A final answer was committed before the process died; settle it.
+        if (
+          resumed &&
+          last.kind === "pi.assistant" &&
+          !this.entryHasToolCalls(last)
+        ) {
+          await this.storage.settleSubmissionIds(inputIds, "done", { answerEntryId: last.id });
+          settled = true;
+          break;
+        }
+
+        live.run = { inputs: inputIds, turns: turn };
+        const messages = await this.contextMessages(conversationId, new Set(inputIds));
+        if (
+          !messages.some(
+            (message) => message.role === "user" || message.role === "toolResult",
+          )
+        ) {
+          break;
+        }
+
+        const assistant = await this.generate(
+          conversationId,
+          messages,
+          controller.signal,
+          live,
+        );
+        const toolCalls = assistant.content.filter(
+          (block): block is Extract<AssistantContent, { type: "toolCall" }> =>
+            block.type === "toolCall",
+        );
+        if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+        let entryId = 0;
+        await this.storage.tx(async () => {
+          entryId = await this.storage.appendEntry({
+            conversationId,
+            kind: "pi.assistant",
+            model: [assistant],
+          });
+          await this.addUsage(conversationId, assistant.usage);
+          // Tool intents are committed with the assistant entry. A crash after
+          // this commit leaves a durable task, so an unsafe tool is never
+          // silently re-executed from a bare tool-call block.
+          for (const call of toolCalls) {
+            const spec = this.runner.specs.find((entry) => entry.name === call.name);
+            if (!spec) continue;
+            await this.storage.createToolTask(
+              conversationId,
+              call.id,
+              call.name,
+              call.arguments,
+              spec.replaySafe,
+            );
+          }
+        });
+        live.generation = undefined;
+        await this.emit(conversationId);
+
+        if (toolCalls.length > 0) {
+          for (const call of toolCalls) {
+            if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+            await this.executeTool(
+              conversationId,
+              call,
+              controller.signal,
+              live,
+              isLeaseValid,
+            );
+          }
+          continue;
+        }
+
+        if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+        await this.storage.settleSubmissionIds(inputIds, "done", {
+          answerEntryId: entryId,
+        });
+        settled = true;
+        live.run = undefined;
+        break;
+      }
+
+      if (!settled && !controller.signal.aborted && !lostLease) {
+        const detail = `Stopped after ${this.maxTurns} model turns.`;
+        await this.storage.settleSubmissionIds(inputIds, "failed", { error: detail });
+        live.runFailure = { reason: "turn_limit", detail };
+        live.run = undefined;
+        live.generation = undefined;
+        failed = detail;
+      }
+    } catch (error) {
+      lostLease =
+        error instanceof LeaseLost ||
+        this.leaseLost.has(conversationId) ||
+        (isLeaseValid ? !(await isLeaseValid()) : false);
+      if (lostLease) {
+        this.log(`lease lost conversation=${conversationId}`);
+        live.run = undefined;
+        live.generation = undefined;
+      } else if (controller.signal.aborted) {
+        await this.storage.settleSubmissionIds(inputIds, "aborted");
+        for (const task of await this.storage.runningToolTasks(conversationId)) {
+          await this.storage.finishToolTask(task.id, "Interrupted by user.", "aborted");
+        }
+      } else {
+        const message = error instanceof Error ? error.message : String(error);
+        failed = message;
+        const open = await this.storage.queuedSubmissions(conversationId);
+        await this.storage.settleSubmissionIds(
+          open.map((row) => row.id),
+          "failed",
+          { error: message },
+        );
+        live.runFailure = {
+          reason: "model_error",
+          detail: message.slice(0, 800),
+        };
+        live.run = undefined;
+        live.generation = undefined;
+        this.log(`run failed on conversation ${conversationId}: ${message}`);
+      }
+    } finally {
+      clearInterval(cancelTimer);
+      await this.storage.clearCancel(conversationId);
+      live.run = undefined;
+      live.generation = undefined;
+      live.tools = undefined;
+      this.log(`run done conversation=${conversationId}${failed ? ` failed=${failed}` : ""}`);
+      this.aborts.delete(conversationId);
+      this.leaseLost.delete(conversationId);
+      await this.emit(conversationId);
+      this.running.delete(conversationId);
+
+      if (!this.closed && !lostLease && failed === undefined && !controller.signal.aborted) {
+        if ((await this.storage.queuedSubmissions(conversationId)).length > 0) {
+          if (this.autoRun) {
+        setTimeout(() => {
+          void this.run(conversationId).catch(() => undefined);
+        }, 0);
+      }
+          else await this.storage.enqueueRun(conversationId);
+        }
+      }
+    }
+  }
+
+  private entryHasToolCalls(entry: EntryRecord): boolean {
+    const message = entry.model?.[0];
+    return (
+      message?.role === "assistant" &&
+      message.content.some((block) => block.type === "toolCall")
+    );
+  }
+
+  private async pendingToolCalls(conversationId: number): Promise<
+    Array<{
+      id: string;
+      name: string;
+      arguments: JsonObject;
+    }>
+  > {
+    const last = await this.storage.lastEntry(conversationId);
+    if (!last || last.kind === "pi.user") return [];
+
+    const assistant = await this.storage.lastEntryOfKind(conversationId, "pi.assistant");
+    if (!assistant) return [];
+
+    const lastUser = await this.storage.lastEntryOfKind(conversationId, "pi.user");
+    if (lastUser && lastUser.id > assistant.id) return [];
+
+    const message = assistant.model?.[0];
+    if (!message || message.role !== "assistant") return [];
+
+    const calls: Array<{
+      id: string;
+      name: string;
+      arguments: JsonObject;
+    }> = [];
+    for (const block of message.content) {
+      if (block.type !== "toolCall") continue;
+      if (await this.storage.hasToolResult(conversationId, block.id)) continue;
+      calls.push({
+        id: block.id,
+        name: block.name,
+        arguments: block.arguments,
+      });
+    }
+    return calls;
+  }
+
+  private async contextMessages(
+    conversationId: number,
+    activeInputs?: Set<number>,
+  ): Promise<ModelMessage[]> {
+    const { entries } = await this.storage.entries(conversationId, this.maxWindowEntries);
+    const compaction = await this.storage.lastEntryOfKind(conversationId, "pi.compaction");
+    const boundary = compaction?.data as { coversUpTo?: unknown } | undefined;
+    const coversUpTo =
+      typeof boundary?.coversUpTo === "number" ? boundary.coversUpTo : undefined;
+    const messages: ModelMessage[] = [];
+    for (const entry of entries) {
+      if (coversUpTo !== undefined && entry.id <= coversUpTo) continue;
+      if (entry.kind === "pi.compaction") continue;
+      if (entry.kind === "pi.user" && activeInputs) {
+        const data = entry.data as { submissionId?: unknown } | undefined;
+        const submissionId = data?.submissionId;
+        if (typeof submissionId === "number" && !activeInputs.has(submissionId)) {
+          continue;
+        }
+      }
+      if (entry.model) messages.push(...entry.model);
+    }
+    // Keep the request bounded: trim from the front until under ~360k chars.
+    let total = messages.reduce((sum, message) => sum + JSON.stringify(message).length, 0);
+    while (total > 360_000 && messages.length > 10) {
+      const removed = messages.shift();
+      total -= removed ? JSON.stringify(removed).length : 0;
+    }
+    return messages;
+  }
+
+  private async systemPrompt(conversationId: number): Promise<string> {
+    const base = `${this.instructions}
+
+Working directory: ${this.cwd}
+Use the read/write/edit/bash tools. Keep changes small and verify them.`;
+    const compaction = await this.storage.lastEntryOfKind(conversationId, "pi.compaction");
+    const data = compaction?.data as { summary?: unknown } | undefined;
+    return typeof data?.summary === "string" && data.summary !== ""
+      ? `${base}
+
+Summary of earlier context:
+${data.summary}`
+      : base;
+  }
+
+  private async generate(
+    conversationId: number,
+    messages: ModelMessage[],
+    signal: AbortSignal,
+    live: LiveState,
+  ): Promise<AssistantMessage> {
+    const partial: AssistantMessage = {
+      role: "assistant",
+      content: [],
+      stopReason: "pending",
+      timestamp: Date.now(),
+      usage: emptyUsage(),
+    };
+    live.generation = { attempt: 1, message: partial };
+    this.emitThrottled(conversationId);
+
+    let text = "";
+    const toolCalls: Array<{
+      id: string;
+      name: string;
+      arguments: JsonObject;
+    }> = [];
+    let stopReason: "stop" | "toolUse" | "length" = "stop";
+    let usage: Usage = emptyUsage();
+
+    for await (const event of this.provider.stream({
+      model: this.model.modelId,
+      system: await this.systemPrompt(conversationId),
+      messages,
+      tools: [...this.runner.specs],
+      maxTokens: 8192,
+      signal,
+    })) {
+      if (event.type === "text") {
+        text += event.text;
+        partial.content = [{ type: "text", text }];
+        live.generation = { attempt: 1, message: partial };
+        this.emitThrottled(conversationId);
+      } else if (event.type === "toolCall") {
+        toolCalls.push({
+          id: event.id,
+          name: event.name,
+          arguments: event.arguments,
+        });
+      } else if (event.type === "done") {
+        stopReason = event.stopReason;
+        usage = event.usage;
+      } else if (event.type === "error") {
+        throw new Error(event.message);
+      }
+    }
+
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+
+    const content: AssistantContent[] = [];
+    if (text !== "") content.push({ type: "text", text });
+    for (const call of toolCalls) {
+      content.push({ type: "toolCall", ...call });
+    }
+    if (content.length === 0) {
+      throw new Error("The model returned an empty response.");
+    }
+
+    return {
+      role: "assistant",
+      content,
+      stopReason: toolCalls.length > 0 ? "toolUse" : stopReason,
+      timestamp: Date.now(),
+      usage,
+    };
+  }
+
+  private requiresApproval(name: string): boolean {
+    return this.approvals === "ask" && APPROVAL_TOOLS.has(name);
+  }
+
+  /**
+   * Newest `pi.approval` entry for one call id. Scans the tail of the journal
+   * and widens the window until it reaches the start or finds the entry, so a
+   * long conversation cannot hide a pending request.
+   */
+  private async latestApproval(
+    conversationId: number,
+    callId: string,
+  ): Promise<ApprovalState | undefined> {
+    let limit = 200;
+    for (;;) {
+      const { entries } = await this.storage.entries(conversationId, limit);
+      for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index]!;
+        if (entry.kind !== "pi.approval") continue;
+        const data = entry.data as
+          | { callId?: unknown; status?: unknown; requestedAt?: unknown }
+          | undefined;
+        if (!data || data.callId !== callId) continue;
+        if (
+          data.status !== "pending" &&
+          data.status !== "approved" &&
+          data.status !== "denied"
+        ) {
+          continue;
+        }
+        return {
+          status: data.status,
+          ...(typeof data.requestedAt === "number"
+            ? { requestedAt: data.requestedAt }
+            : {}),
+        };
+      }
+      if (entries.length < limit) return undefined;
+      limit *= 2;
+    }
+  }
+
+  /**
+   * Durable wait for a decision. The request is journaled once; every poll
+   * re-reads the newest status so a worker restart resumes here. Abort and a
+   * lost lease win over the approval, and five unanswered minutes are denied.
+   */
+  private async awaitApproval(
+    conversationId: number,
+    call: { id: string; name: string; arguments: JsonObject },
+    options: {
+      signal: AbortSignal;
+      isLeaseValid?: () => Awaitable<boolean>;
+      watchCancel?: boolean;
+    },
+  ): Promise<ApprovalOutcome> {
+    if (!this.requiresApproval(call.name)) return "approved";
+    let requestedAt: number | undefined;
+    for (;;) {
+      if (this.closed) throw abortError();
+      if (options.signal.aborted) throw abortError();
+      if (options.isLeaseValid && !(await options.isLeaseValid())) {
+        throw new LeaseLost();
+      }
+      if (
+        options.watchCancel &&
+        (await this.storage.isCancelRequested(conversationId))
+      ) {
+        throw abortError();
+      }
+
+      const latest = await this.latestApproval(conversationId, call.id);
+      if (latest === undefined) {
+        const now = Date.now();
+        requestedAt = now;
+        await this.storage.tx(async () => {
+          await this.storage.appendEntry({
+            conversationId,
+            kind: "pi.approval",
+            data: {
+              callId: call.id,
+              name: call.name,
+              args: call.arguments,
+              status: "pending",
+              requestedAt: now,
+            },
+          });
+        });
+        this.log(
+          `approval requested conversation=${conversationId} call=${call.id} tool=${call.name}`,
+        );
+        await this.emit(conversationId);
+      } else if (latest.status === "approved") {
+        return "approved";
+      } else if (latest.status === "denied") {
+        return "denied";
+      } else {
+        requestedAt = requestedAt ?? latest.requestedAt ?? Date.now();
+        if (Date.now() - requestedAt >= APPROVAL_TIMEOUT_MS) {
+          await this.storage.tx(async () => {
+            await this.storage.appendEntry({
+              conversationId,
+              kind: "pi.approval",
+              data: {
+                callId: call.id,
+                status: "denied",
+                decidedAt: Date.now(),
+              },
+            });
+          });
+          this.log(
+            `approval timed out conversation=${conversationId} call=${call.id}`,
+          );
+          await this.emit(conversationId);
+          return "timeout";
+        }
+      }
+      await sleepWithSignal(APPROVAL_POLL_MS, options.signal);
+    }
+  }
+
+  /** Journal the denial as an ordinary tool error; the task is finished failed. */
+  private async journalApprovalDenial(
+    task: ToolTaskRow,
+    outcome: "denied" | "timeout",
+  ): Promise<void> {
+    const minutes = Math.round(APPROVAL_TIMEOUT_MS / 60_000);
+    const content =
+      outcome === "timeout"
+        ? `Approval timed out after ${minutes} minutes for tool "${task.name}". The tool was not executed.`
+        : `Approval denied for tool "${task.name}". The tool was not executed.`;
+    await this.storage.tx(async () => {
+      await this.storage.appendEntry({
+        conversationId: task.conversation_id,
+        kind: "pi.tool-result",
+        byTaskId: task.id,
+        model: [
+          {
+            role: "toolResult",
+            toolCallId: task.call_id,
+            toolName: task.name,
+            content,
+            isError: true,
+            timestamp: Date.now(),
+          },
+        ],
+      });
+      await this.storage.finishToolTask(task.id, content, "failed");
+    });
+  }
+
+  private async executeTool(
+    conversationId: number,
+    call: { id: string; name: string; arguments: JsonObject },
+    signal: AbortSignal,
+    live: LiveState,
+    isLeaseValid?: () => Awaitable<boolean>,
+  ): Promise<void> {
+    if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+    const spec = this.runner.specs.find((entry) => entry.name === call.name);
+    if (!spec) {
+      await this.storage.tx(async () =>
+        await this.storage.appendEntry({
+          conversationId,
+          kind: "pi.tool-result",
+          model: [
+            {
+              role: "toolResult",
+              toolCallId: call.id,
+              toolName: call.name,
+              content: `Unknown tool: ${call.name}`,
+              isError: true,
+              timestamp: Date.now(),
+            },
+          ],
+        }),
+      );
+      await this.emit(conversationId);
+      return;
+    }
+
+    if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+    let task = await this.storage.findToolTask(conversationId, call.id);
+    if (!task) {
+      if (!spec.replaySafe) {
+        await this.storage.tx(async () =>
+          await this.storage.appendEntry({
+            conversationId,
+            kind: "pi.tool-result",
+            model: [
+              {
+                role: "toolResult",
+                toolCallId: call.id,
+                toolName: call.name,
+                content:
+                  "Interrupted before the tool ran; not replayed because it is not replay-safe.",
+                isError: true,
+                timestamp: Date.now(),
+              },
+            ],
+          }),
+        );
+        await this.emit(conversationId);
+        return;
+      }
+      task = await this.storage.tx(async () =>
+        await this.storage.createToolTask(
+          conversationId,
+          call.id,
+          call.name,
+          call.arguments,
+          spec.replaySafe,
+        ),
+      );
+    }
+    if (task.status !== "running") {
+      await this.storage.tx(async () =>
+        await this.storage.appendEntry({
+          conversationId,
+          kind: "pi.tool-result",
+          model: [
+            {
+              role: "toolResult",
+              toolCallId: call.id,
+              toolName: call.name,
+              content: "Tool was interrupted before it completed.",
+              isError: true,
+              timestamp: Date.now(),
+            },
+          ],
+        }),
+      );
+      await this.emit(conversationId);
+      return;
+    }
+    const slot: ToolSlot = {
+      callId: call.id,
+      name: call.name,
+      status: "running",
+      output: "",
+    };
+    live.tools = [...(live.tools ?? []), slot];
+    await this.emit(conversationId);
+
+    // In ask mode the call is already a durable task; the journaled decision is
+    // what lets it run. Denial is an ordinary tool error, so the model continues.
+    const decision = await this.awaitApproval(conversationId, call, {
+      signal,
+      ...(isLeaseValid ? { isLeaseValid } : {}),
+    });
+    if (decision !== "approved") {
+      await this.journalApprovalDenial(task, decision);
+      live.tools = (live.tools ?? []).filter((entry) => entry.callId !== call.id);
+      await this.emit(conversationId);
+      return;
+    }
+
+    try {
+      const result = await this.runner.execute(call.name, call.arguments, {
+        cwd: this.cwd,
+        signal,
+        taskId: task.id,
+        output: (chunk) => {
+          slot.output = `${slot.output ?? ""}${chunk}`.slice(-16_000);
+          this.emitThrottled(conversationId);
+        },
+      });
+      if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+      slot.status = "done";
+      await this.storage.tx(async () => {
+        await this.storage.appendEntry({
+          conversationId,
+          kind: "pi.tool-result",
+          byTaskId: task.id,
+          model: [
+            {
+              role: "toolResult",
+              toolCallId: call.id,
+              toolName: call.name,
+              content: result.content,
+              isError: result.isError === true,
+              timestamp: Date.now(),
+            },
+          ],
+        });
+        await this.storage.finishToolTask(
+          task.id,
+          result.content.slice(0, 16_000),
+          result.isError ? "failed" : "done",
+        );
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const aborted = signal.aborted;
+      if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+      slot.status = "done";
+      await this.storage.tx(async () => {
+        await this.storage.appendEntry({
+          conversationId,
+          kind: "pi.tool-result",
+          byTaskId: task.id,
+          model: [
+            {
+              role: "toolResult",
+              toolCallId: call.id,
+              toolName: call.name,
+              content: aborted ? "Interrupted by user." : message,
+              isError: true,
+              timestamp: Date.now(),
+            },
+          ],
+        });
+        await this.storage.finishToolTask(
+          task.id,
+          message.slice(0, 16_000),
+          aborted ? "aborted" : "failed",
+        );
+      });
+      if (aborted) throw new DOMException("Aborted", "AbortError");
+    }
+    live.tools = (live.tools ?? []).filter(
+      (entry) => entry.callId !== call.id,
+    );
+    await this.emit(conversationId);
+  }
+
+  private async addUsage(conversationId: number, usage: Usage): Promise<void> {
+    const docs = await this.storage.docs(conversationId);
+    const previous = docs["pi.usage"] as
+      | { input?: number; output?: number; totalTokens?: number }
+      | undefined;
+    await this.storage.putDoc(conversationId, "pi.usage", {
+      input: (previous?.input ?? 0) + usage.input,
+      output: (previous?.output ?? 0) + usage.output,
+      totalTokens: (previous?.totalTokens ?? 0) + usage.totalTokens,
+    });
+  }
+
+  private liveDoc(conversationId: number): JsonObject {
+    const live = this.live.get(conversationId);
+    if (!live) return {};
+    return {
+      ...(live.run
+        ? { run: { inputs: live.run.inputs, turns: live.run.turns } }
+        : {}),
+      ...(live.generation
+        ? {
+            generation: {
+              attempt: live.generation.attempt,
+              ...(live.generation.message
+                ? { message: live.generation.message as unknown as JsonObject }
+                : {}),
+            },
+          }
+        : {}),
+      ...(live.tools ? { tools: live.tools as unknown as JsonObject } : {}),
+      ...(live.runFailure
+        ? { runFailure: live.runFailure as unknown as JsonObject }
+        : {}),
+    };
+  }
+
+  private emit(conversationId: number): Promise<void> {
+    if (this.closed) return Promise.resolve();
+    const task = this.emitNow(conversationId);
+    this.pendingEmits.add(task);
+    void task
+      .catch(() => undefined)
+      .finally(() => this.pendingEmits.delete(task));
+    return task;
+  }
+
+  private async emitNow(conversationId: number): Promise<void> {
+    const cursor = (this.cursors.get(conversationId) ?? 0) + 1;
+    this.cursors.set(conversationId, cursor);
+    await this.storage.putDoc(conversationId, "pi.live", this.liveDoc(conversationId));
+    this.lastEmit.set(conversationId, Date.now());
+
+    const set = this.listeners.get(conversationId);
+    if (!set || set.size === 0) return;
+    const view = await this.view(conversationId);
+    for (const listener of set) {
+      try {
+        listener(view, cursor);
+      } catch {
+        /* listener failure must not break the run */
+      }
+    }
+  }
+
+  private emitThrottled(conversationId: number): void {
+    if (this.closed) return;
+    if (this.emitTimers.has(conversationId)) return;
+    const elapsed = Date.now() - (this.lastEmit.get(conversationId) ?? 0);
+    if (elapsed >= 120) {
+      void this.emit(conversationId);
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.emitTimers.delete(conversationId);
+      void this.emit(conversationId);
+    }, 120 - elapsed);
+    this.emitTimers.set(conversationId, timer);
+  }
+}
+
+export type { SubmissionRow, ToolTaskRow } from "./ports.js";

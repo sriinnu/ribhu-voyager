@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" shape-rendering="crispEdges">
+  <style>
+    .ink { fill: #182033 }
+    .seam { fill: #B8892E }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #ECE8DF }
+      .seam { fill: #A9781F }
+    }
+  </style>
+  <rect class="ink" x="1" y="1" width="14" height="14"/>
+  <rect class="seam" x="6" y="1" width="2" height="4"/>
+  <rect class="seam" x="6" y="4" width="6" height="2"/>
+  <rect class="seam" x="10" y="4" width="2" height="8"/>
+  <rect class="seam" x="6" y="10" width="6" height="2"/>
+  <rect class="seam" x="6" y="10" width="2" height="5"/>
+</svg>

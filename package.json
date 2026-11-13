@@ -1,0 +1,34 @@
+{
+  "name": "ribhu-voyager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n api,worker,mobile -c yellow,magenta,cyan \"npm:dev:api\" \"npm:dev:worker\" \"npm:dev:mobile\"",
+    "dev:api": "npm run dev:api -w @ribhu-voyager/server",
+    "dev:worker": "npm run dev:worker -w @ribhu-voyager/server",
+    "dev:mobile": "npm run dev -w @ribhu-voyager/mobile",
+    "build": "npm run build -w @ribhu-voyager/mobile",
+    "start": "concurrently -k -n api,worker -c yellow,magenta \"npm:start:api\" \"npm:start:worker\"",
+    "start:api": "npm run start:api -w @ribhu-voyager/server",
+    "start:worker": "npm run start:worker -w @ribhu-voyager/server",
+    "test": "node --import tsx --test --test-concurrency=1 apps/server/test/*.test.ts",
+    "typecheck": "tsc -p packages/engine/tsconfig.json --noEmit && tsc -p packages/storage-postgres/tsconfig.json --noEmit && tsc -p apps/server/tsconfig.json --noEmit && tsc -p apps/mobile/tsconfig.json --noEmit",
+    "migrate:postgres": "npm run migrate -w @ribhu-voyager/storage-postgres --",
+    "tokens:postgres": "npm run tokens -w @ribhu-voyager/storage-postgres --",
+    "provision:postgres": "npm run provision -w @ribhu-voyager/storage-postgres --"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "concurrently": "^10.0.6",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.0"
+  }
+}

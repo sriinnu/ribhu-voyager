@@ -1,0 +1,23 @@
+{
+  "name": "@ribhu-voyager/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:api": "tsx watch src/index.ts",
+    "dev:worker": "tsx watch src/worker-main.ts",
+    "start:api": "tsx src/index.ts",
+    "start:worker": "tsx src/worker-main.ts"
+  },
+  "dependencies": {
+    "@ribhu-voyager/engine": "*",
+    "@ribhu-voyager/protocol": "*",
+    "@ribhu-voyager/providers": "*",
+    "@ribhu-voyager/storage-postgres": "*",
+    "@ribhu-voyager/storage-sqlite": "*",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
+  }
+}
