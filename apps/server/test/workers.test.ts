@@ -60,3 +60,73 @@ test("two workers never answer one submission twice", { timeout: 30_000 }, async
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor<T>(
+  probe: () => Promise<T | undefined>,
+  timeoutMs = 10_000,
+): Promise<T> {
+  const start = Date.now();
+  for (;;) {
+    const value = await probe();
+    if (value !== undefined) return value;
+    if (Date.now() - start >= timeoutMs) {
+      throw new Error("timed out waiting for the expected state");
+    }
+    await sleep(50);
+  }
+}
+
+test("worker shutdown clears only its own health keys", { timeout: 30_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ribhu-worker-keys-"));
+  const api = await createApiRuntime(configFor(dir));
+  const worker = await startWorker(configFor(dir));
+  try {
+    const owner = await waitFor(async () => {
+      const pairs = await api.storage.settingsMatching("worker_heartbeat:");
+      const active = pairs.find((pair) => Number(pair.value) > 0);
+      return active
+        ? active.key.slice("worker_heartbeat:".length)
+        : undefined;
+    });
+
+    // Simulate another worker owning the aggregate job slot.
+    const foreignJob = JSON.stringify({
+      id: 99,
+      conversationId: 1,
+      owner: "other:owner",
+      startedAt: Date.now(),
+    });
+    await api.storage.setSetting("worker_job", foreignJob);
+    await api.storage.setSetting(
+      `worker_job:${owner}`,
+      JSON.stringify({
+        id: 1,
+        conversationId: 1,
+        owner,
+        startedAt: Date.now(),
+      }),
+    );
+
+    await worker.close();
+
+    assert.equal(
+      await api.storage.getSetting(`worker_job:${owner}`),
+      "",
+      "the worker cleared its own job key",
+    );
+    assert.equal(
+      await api.storage.getSetting("worker_job"),
+      foreignJob,
+      "another worker's aggregate job is untouched",
+    );
+    const activeHeartbeats = (
+      await api.storage.settingsMatching("worker_heartbeat:")
+    ).filter((pair) => Number(pair.value) > 0);
+    assert.equal(activeHeartbeats.length, 0, "its own heartbeat is cleared");
+  } finally {
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

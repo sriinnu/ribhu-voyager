@@ -9,6 +9,7 @@ import type {
   JsonObject,
   ModelMessage,
   QueueJob,
+  SettingPair,
   Storage,
   SubmissionOptions,
   SubmissionRow,
@@ -1023,6 +1024,15 @@ export class Db implements Storage {
         "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       )
       .run(key, value);
+  }
+
+  settingsMatching(prefix: string): SettingPair[] {
+    // Prefix match without LIKE escaping: compare the leading slice exactly.
+    return this.db
+      .prepare(
+        "SELECT key, value FROM settings WHERE substr(key, 1, ?) = ? ORDER BY key",
+      )
+      .all(prefix.length, prefix) as SettingPair[];
   }
 
   requestCancel(conversationId: number): void {

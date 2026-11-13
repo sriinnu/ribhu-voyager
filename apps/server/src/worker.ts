@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import {
   type Conversation,
   type ModelRef,
   type Provider,
+  type QueueJob,
   type Storage,
 } from "@ribhu-voyager/engine";
 import { createProvider } from "@ribhu-voyager/providers";
@@ -17,6 +19,7 @@ import { AuthManager } from "./auth.js";
 import { PiAuthStore, defaultAuthFile } from "./auth-store.js";
 import { ClaudeCodeAuthStore } from "./claude-code-auth.js";
 import type { Config } from "./config.js";
+import { WORKER_STALE_MS } from "./health.js";
 import { createToolRunner } from "./tools-runtime.js";
 
 const INSTRUCTIONS = [
@@ -115,10 +118,82 @@ export async function startWorker(
   });
 
   const root = await engine.root();
-  await storage.setSetting("worker_job", "");
-  const owner = `${hostname()}:${process.pid}`;
+  // Unique per worker instance: two workers in one process must not share a
+  // health key, while the owner string stays stable for the whole lifetime.
+  const owner = `${hostname()}:${process.pid}:${randomUUID().slice(0, 8)}`;
+  const heartbeatKey = `worker_heartbeat:${owner}`;
+  const jobKey = `worker_job:${owner}`;
   let stopped = false;
   let current: Promise<void> | null = null;
+
+  const writeHeartbeat = async () => {
+    const now = String(Date.now());
+    try {
+      // Aggregate key keeps older clients working; per-owner key lets health
+      // report every worker instead of whichever one wrote last.
+      await storage.setSetting("worker_heartbeat", now);
+      await storage.setSetting(heartbeatKey, now);
+    } catch {
+      /* storage unavailable */
+    }
+  };
+
+  const publishJob = async (job: QueueJob) => {
+    const value = JSON.stringify({
+      id: job.id,
+      conversationId: job.conversation_id,
+      owner,
+      startedAt: Date.now(),
+    });
+    await storage.setSetting("worker_job", value);
+    await storage.setSetting(jobKey, value);
+  };
+
+  const clearJobKeys = async () => {
+    try {
+      await storage.setSetting(jobKey, "");
+    } catch {
+      /* storage unavailable */
+    }
+    try {
+      // Only clear the aggregate when it still names this worker, so one
+      // worker finishing never erases another worker's job.
+      const raw = await storage.getSetting("worker_job");
+      if (!raw) return;
+      let currentOwner: unknown;
+      try {
+        currentOwner = (JSON.parse(raw) as { owner?: unknown }).owner;
+      } catch {
+        currentOwner = undefined;
+      }
+      if (currentOwner === owner) await storage.setSetting("worker_job", "");
+    } catch {
+      /* storage unavailable */
+    }
+  };
+
+  const clearHeartbeat = async () => {
+    try {
+      await storage.setSetting(heartbeatKey, "");
+    } catch {
+      /* storage unavailable */
+    }
+    try {
+      // Drop the aggregate heartbeat too once no worker is alive, so a graceful
+      // shutdown does not leave a fresh-but-dead aggregate for old clients.
+      const remaining = await storage.settingsMatching("worker_heartbeat:");
+      const now = Date.now();
+      const anyAlive = remaining.some((pair) => {
+        const timestamp = Number(pair.value);
+        return timestamp > 0 && now - timestamp < WORKER_STALE_MS;
+      });
+      if (!anyAlive) await storage.setSetting("worker_heartbeat", "");
+    } catch {
+      /* storage unavailable */
+    }
+  };
+
+  await clearJobKeys();
 
   for (const id of await storage.conversationIdsWithOpenWork()) {
     await storage.enqueueRun(id);
@@ -149,30 +224,16 @@ export async function startWorker(
     while (!stopped) {
       try {
         await syncAuth();
-        await storage.setSetting("worker_heartbeat", String(Date.now()));
+        await writeHeartbeat();
         const job = await storage.claimRun(owner, LEASE_MS);
         if (!job) {
           await new Promise((resolve) => setTimeout(resolve, IDLE_MS));
           continue;
         }
         log(`job ${job.id} conversation ${job.conversation_id}`);
-        await storage.setSetting(
-          "worker_job",
-          JSON.stringify({
-            id: job.id,
-            conversationId: job.conversation_id,
-            owner,
-            startedAt: Date.now(),
-          }),
-        );
+        await publishJob(job);
         const heartbeat = setInterval(() => {
-          void (async () => {
-            try {
-              await storage.setSetting("worker_heartbeat", String(Date.now()));
-            } catch {
-              /* storage unavailable */
-            }
-          })();
+          void writeHeartbeat();
         }, 10_000);
         heartbeat.unref?.();
         const renew = setInterval(async () => {
@@ -218,10 +279,10 @@ export async function startWorker(
                 await storage.enqueueRun(job.conversation_id);
               }
             });
-            await storage.setSetting("worker_job", "");
           } catch (error) {
             log(`job cleanup failed: ${String(error)}`);
           }
+          await clearJobKeys();
         }
       } catch (error) {
         try {
@@ -260,11 +321,8 @@ export async function startWorker(
       } finally {
         if (deadline) clearTimeout(deadline);
       }
-      try {
-        await storage.setSetting("worker_job", "");
-      } catch {
-        /* storage unavailable during shutdown */
-      }
+      await clearJobKeys();
+      await clearHeartbeat();
       await engine.close();
     },
   };

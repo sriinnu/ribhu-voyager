@@ -9,6 +9,17 @@ import type {
 } from "@ribhu-voyager/protocol";
 import { PROTOCOL_VERSION } from "@ribhu-voyager/protocol";
 
+import {
+  isOAuthLink,
+  listenForAppUrls,
+  parseDeepLink,
+  type AppUrlListener,
+  type DeepLink,
+  type OAuthCallback,
+  type OAuthErrorLink,
+} from "./deep-link";
+import { tokenStore } from "./storage";
+
 export type { ApprovalDecision };
 
 export type OutboxState = "queued" | "sending" | "failed";
@@ -45,6 +56,12 @@ export type State = {
   error: string | null;
   lastAckAt: number | null;
   connectedAt: number | null;
+  /** Gateway base URL (http/https). Defaults to this page's origin. */
+  gateway: string;
+  /** Bearer token for the gateway; shown only in the Settings editor. */
+  token: string;
+  /** Last OAuth deep link received; the code exchange is not wired yet. */
+  oauth: OAuthCallback | OAuthErrorLink | null;
 };
 
 type Persisted = {
@@ -66,8 +83,8 @@ type OutboxMirror = {
 const DB_NAME = "ribhu";
 const DB_STORE = "session";
 const DB_KEY = "state";
-const TOKEN_KEY = "ribhu.token";
 const CLIENT_KEY = "ribhu.clientId";
+const GATEWAY_KEY = "ribhu.gateway";
 const SESSION_KEY = "ribhu.session";
 const OUTBOX_KEY = "ribhu.outbox";
 
@@ -166,16 +183,64 @@ function persist(value: Persisted): void {
   }, 300);
 }
 
-function readToken(): string {
+/** Consume a `?token=` from the address bar once, then clean the URL. */
+function readTokenFromUrl(): string | null {
   const url = new URL(window.location.href);
   const fromUrl = url.searchParams.get("token");
-  if (fromUrl) {
-    localStorage.setItem(TOKEN_KEY, fromUrl);
-    url.searchParams.delete("token");
-    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
-    return fromUrl;
+  if (!fromUrl) return null;
+  url.searchParams.delete("token");
+  window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  return fromUrl;
+}
+
+export type GatewayValidation =
+  | { ok: true; gateway: string }
+  | { ok: false; error: string };
+
+/**
+ * Validate and normalise a gateway base URL. Only http(s) is accepted; a bare
+ * host is treated as https, matching how a native shell would reach a gateway.
+ */
+export function validateGatewayUrl(input: string): GatewayValidation {
+  const raw = input.trim();
+  if (raw === "") {
+    return { ok: false, error: "Enter a gateway URL, for example https://gateway.example.com." };
   }
-  return localStorage.getItem(TOKEN_KEY) ?? "";
+  let parsed: URL;
+  try {
+    parsed = new URL(raw.includes("://") ? raw : `https://${raw}`);
+  } catch {
+    return { ok: false, error: "That does not look like a valid URL." };
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { ok: false, error: "The gateway must use http:// or https:// (not ws://)." };
+  }
+  if (parsed.username !== "" || parsed.password !== "") {
+    return { ok: false, error: "Put credentials in the token field, not in the URL." };
+  }
+  const path = parsed.pathname.replace(/\/+$/, "");
+  return { ok: true, gateway: `${parsed.origin}${path}` };
+}
+
+function readGateway(): string {
+  try {
+    const stored = localStorage.getItem(GATEWAY_KEY);
+    if (stored) {
+      const checked = validateGatewayUrl(stored);
+      if (checked.ok) return checked.gateway;
+    }
+  } catch {
+    /* storage disabled: fall back to this page's origin */
+  }
+  return window.location.origin;
+}
+
+function persistGateway(gateway: string): void {
+  try {
+    localStorage.setItem(GATEWAY_KEY, gateway);
+  } catch {
+    /* private mode: the setting still applies for this page session */
+  }
 }
 
 function newClientId(): string {
@@ -203,6 +268,9 @@ export class Session {
     error: null,
     lastAckAt: null,
     connectedAt: null,
+    gateway: window.location.origin,
+    token: "",
+    oauth: null,
   };
 
   private listeners = new Set<() => void>();
@@ -217,6 +285,7 @@ export class Session {
   private clientId = "";
   private started = false;
   private nextReconnectAt = 0;
+  private appUrlListener: AppUrlListener | null = null;
 
   getSnapshot = (): State => this.state;
 
@@ -230,7 +299,18 @@ export class Session {
     this.started = true;
 
     this.clientId = newClientId();
-    this.token = readToken();
+    const tokenFromUrl = readTokenFromUrl();
+    this.token = tokenFromUrl ?? (await tokenStore.get());
+    if (tokenFromUrl !== null) await tokenStore.set(tokenFromUrl);
+
+    const gateway = readGateway();
+    const initialLink = parseDeepLink(window.location.href);
+    this.state = {
+      ...this.state,
+      gateway,
+      token: this.token,
+      ...(isOAuthLink(initialLink) ? { oauth: initialLink } : {}),
+    };
 
     const persisted = await loadPersisted();
     if (persisted) {
@@ -258,6 +338,8 @@ export class Session {
     document.addEventListener("visibilitychange", this.onVisibility);
     window.addEventListener("pagehide", this.flushPersist);
 
+    this.appUrlListener = await listenForAppUrls((link) => this.handleDeepLink(link));
+
     this.connect();
 
     this.heartbeat = setInterval(() => this.beat(), 20_000);
@@ -269,12 +351,85 @@ export class Session {
     if (this.heartbeat) clearInterval(this.heartbeat);
     if (this.sweep) clearInterval(this.sweep);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.appUrlListener?.stop();
+    this.appUrlListener = null;
     this.socket?.close();
     this.socket = null;
     window.removeEventListener("online", this.onOnline);
     window.removeEventListener("offline", this.onOffline);
     document.removeEventListener("visibilitychange", this.onVisibility);
     window.removeEventListener("pagehide", this.flushPersist);
+  }
+
+  /**
+   * Persist a new gateway URL and/or token, then reconnect. Returns a
+   * validation error message, or null when the settings were applied.
+   */
+  saveGateway(input: string, token: string): string | null {
+    const checked = validateGatewayUrl(input);
+    if (!checked.ok) return checked.error;
+
+    const gateway = checked.gateway;
+    const nextToken = token.trim();
+    const gatewayChanged = gateway !== this.state.gateway;
+
+    this.token = nextToken;
+    persistGateway(gateway);
+    void tokenStore.set(nextToken).catch(() => undefined);
+
+    this.state = gatewayChanged
+      ? {
+          // A different server means the cached replica belongs to someone
+          // else: drop it and attach fresh.
+          ...this.state,
+          gateway,
+          token: nextToken,
+          view: null,
+          cursor: 0,
+          conversationId: null,
+          conversations: [],
+          archivedConversations: [],
+          searchResults: [],
+          status: "connecting",
+          error: null,
+        }
+      : { ...this.state, gateway, token: nextToken, error: null };
+    this.emit();
+    this.persistSoon();
+    this.restartConnection();
+    return null;
+  }
+
+  /** Dismiss the "OAuth callback received" notice. */
+  dismissOAuth(): void {
+    if (this.state.oauth === null) return;
+    this.state = { ...this.state, oauth: null };
+    this.emit();
+  }
+
+  private handleDeepLink(link: DeepLink): void {
+    if (!isOAuthLink(link)) return;
+    this.state = { ...this.state, oauth: link };
+    this.emit();
+  }
+
+  /** Drop the current socket and reconnect with the current gateway/token. */
+  private restartConnection(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.welcomed = false;
+    const socket = this.socket;
+    this.socket = null;
+    try {
+      socket?.close();
+    } catch {
+      /* already closed */
+    }
+    this.attempts = 0;
+    this.nextReconnectAt = 0;
+    this.connect();
   }
 
   /** Reconnect immediately (used by the "Retry now" action). */
@@ -516,9 +671,11 @@ export class Session {
   }
 
   private url(): string {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const base = new URL(this.state.gateway);
+    const path = base.pathname.replace(/\/+$/, "");
+    const protocol = base.protocol === "https:" ? "wss:" : "ws:";
     const query = this.token ? `?token=${encodeURIComponent(this.token)}` : "";
-    return `${protocol}//${window.location.host}/ws${query}`;
+    return `${protocol}//${base.host}${path}/ws${query}`;
   }
 
   private connect(): void {

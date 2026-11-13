@@ -81,6 +81,9 @@ export type SubmissionOptions = {
 
 export type Awaitable<T> = T | Promise<T>;
 
+/** One `settings` row exposed by `settingsMatching`. */
+export type SettingPair = { key: string; value: string };
+
 /**
  * The journal boundary as implemented synchronously by SQLite. `Storage`
  * below widens every method to `Awaitable`, so the same engine can run on
@@ -145,6 +148,8 @@ export interface SyncStorage {
 
   getSetting(key: string): string | undefined;
   setSetting(key: string, value: string): void;
+  /** Every setting whose key starts with `prefix`, ordered by key. */
+  settingsMatching(prefix: string): SettingPair[];
 
   requestCancel(conversationId: number): void;
   isCancelRequested(conversationId: number): boolean;

@@ -1024,6 +1024,22 @@ a {
   margin-left: 0;
 }
 
+/* OAuth deep link arrived; the token exchange is not wired yet. */
+.banner--oauth {
+  background: #1c1a0f;
+  border-top-color: #3d3720;
+  color: #f0e3c4;
+  justify-content: space-between;
+}
+
+.banner--oauth button {
+  border: 0;
+  padding: 2px;
+  display: grid;
+  place-items: center;
+  margin-left: 0;
+}
+
 /* ---------- composer ---------- */
 
 .composer-wrap {
@@ -1540,6 +1556,87 @@ a {
   font-size: 11.5px;
   line-height: 1.55;
   color: var(--dim);
+}
+
+/* ---------- settings (gateway + notifications) ---------- */
+
+.settings {
+  margin-top: 14px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.settings-field > span:first-child {
+  font-size: 11.5px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.settings-field .conv-search {
+  margin: 0;
+}
+
+.settings-token {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.settings-token .conv-search {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-reveal {
+  flex: none;
+  padding: 0 12px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.settings-hint {
+  margin-top: 8px;
+}
+
+.settings-error {
+  margin: 10px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #ffb3b3;
+}
+
+.settings-saved {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--ok);
+}
+
+.settings-save {
+  width: 100%;
+  margin-top: 10px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid var(--amber-line);
+  background: var(--amber-soft);
+  color: var(--amber);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.settings-save:active {
+  filter: brightness(1.15);
 }
 
 .sr-only {

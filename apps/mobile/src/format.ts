@@ -236,6 +236,13 @@ export function approvalPreview(approval: Approval, max = 160): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+/** Every tool call currently waiting on a human decision. */
+export function pendingApprovals(view: WireView | null): Approval[] {
+  if (!view) return [];
+  const { approvals } = foldApprovals(view);
+  return [...approvals.values()].filter((approval) => approval.status === "pending");
+}
+
 export type Timeline = {
   items: Item[];
   busy: boolean;

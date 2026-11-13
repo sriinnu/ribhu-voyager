@@ -12,7 +12,12 @@ import {
   type ToolSpec,
 } from "@ribhu-voyager/engine";
 
-import { runDockerShell } from "./sandbox.js";
+import {
+  runDockerFileOp,
+  runDockerShell,
+  type DockerFileRequest,
+  type DockerSandboxOptions,
+} from "./sandbox.js";
 
 export type ToolRunnerOptions = {
   sandbox?: "local" | "docker";
@@ -38,11 +43,16 @@ function bounded(text: string, limit = MAX_OUTPUT): string {
   return `${text.slice(0, limit)}\n… [truncated ${text.length - limit} chars]`;
 }
 
-function pathFrom(args: JsonObject, cwd: string): string {
+function rawPath(args: JsonObject): string {
   const value = args.path;
   if (typeof value !== "string" || value.trim() === "") {
     throw new Error("path must be a non-empty string");
   }
+  return value;
+}
+
+function pathFrom(args: JsonObject, cwd: string): string {
+  const value = rawPath(args);
   const root = realpathSync(resolve(cwd));
   const target = resolve(root, value);
   let resolved = target;
@@ -204,6 +214,28 @@ function runShell(
   });
 }
 
+/** Turns raw file contents into the numbered read output (shared by both modes). */
+function renderRead(raw: string, args: JsonObject): string {
+  if (raw.includes("\u0000")) {
+    throw new Error("file appears to be binary");
+  }
+  const lines = raw.split("\n");
+  const offset = Math.max(1, typeof args.offset === "number" ? Math.floor(args.offset) : 1);
+  const limit = Math.min(
+    4000,
+    typeof args.limit === "number" ? Math.max(1, Math.floor(args.limit)) : 2000,
+  );
+  const slice = lines.slice(offset - 1, offset - 1 + limit);
+  const numbered = slice
+    .map((line, index) => `${String(offset + index).padStart(5, " ")}  ${line}`)
+    .join("\n");
+  const suffix =
+    offset - 1 + slice.length < lines.length
+      ? `\n… ${lines.length - (offset - 1 + slice.length)} more lines`
+      : "";
+  return numbered + suffix;
+}
+
 const read: LocalTool = {
   name: "read",
   description:
@@ -222,24 +254,7 @@ const read: LocalTool = {
   async execute(args, context) {
     const path = pathFrom(args, context.cwd);
     const raw = await readFile(path, "utf8");
-    if (raw.includes("\u0000")) {
-      throw new Error("file appears to be binary");
-    }
-    const lines = raw.split("\n");
-    const offset = Math.max(1, typeof args.offset === "number" ? Math.floor(args.offset) : 1);
-    const limit = Math.min(
-      4000,
-      typeof args.limit === "number" ? Math.max(1, Math.floor(args.limit)) : 2000,
-    );
-    const slice = lines.slice(offset - 1, offset - 1 + limit);
-    const numbered = slice
-      .map((line, index) => `${String(offset + index).padStart(5, " ")}  ${line}`)
-      .join("\n");
-    const suffix =
-      offset - 1 + slice.length < lines.length
-        ? `\n… ${lines.length - (offset - 1 + slice.length)} more lines`
-        : "";
-    return { content: numbered + suffix };
+    return { content: renderRead(raw, args) };
   },
 };
 
@@ -300,39 +315,107 @@ const edit: LocalTool = {
   },
 };
 
-export function createToolRunner(options: ToolRunnerOptions = {}): ToolRunner {
-  const bashTool =
-    options.sandbox === "docker"
-      ? {
-          ...bash,
-          async execute(args: JsonObject, context: ToolContext) {
-            const command = args.command;
-            if (typeof command !== "string" || command.trim() === "") {
-              throw new Error("command must be a non-empty string");
-            }
-            const timeout = Math.min(
-              600_000,
-              typeof args.timeout === "number" && args.timeout > 0
-                ? args.timeout
-                : DEFAULT_TIMEOUT_MS,
-            );
-            return runDockerShell(command, context, timeout, {
-              image: options.image ?? "node:24-bookworm",
-              ...(options.network ? { network: options.network } : {}),
-              ...(options.dockerPath ? { dockerPath: options.dockerPath } : {}),
-            });
-          },
+function dockerSandboxOptions(options: ToolRunnerOptions): DockerSandboxOptions {
+  return {
+    image: options.image ?? "node:24-bookworm",
+    ...(options.network ? { network: options.network } : {}),
+    ...(options.dockerPath ? { dockerPath: options.dockerPath } : {}),
+  };
+}
+
+/**
+ * read/write/edit variants that execute inside the hardened container. Path
+ * containment is enforced container-side by `runDockerFileOp`; the numbered
+ * read formatting is shared with local mode so semantics are identical.
+ */
+function dockerFileTools(options: ToolRunnerOptions): {
+  read: LocalTool;
+  write: LocalTool;
+  edit: LocalTool;
+} {
+  const sandboxOptions = dockerSandboxOptions(options);
+  const run = (request: DockerFileRequest, context: ToolContext) =>
+    runDockerFileOp(request, context, DEFAULT_TIMEOUT_MS, sandboxOptions);
+  return {
+    read: {
+      ...read,
+      async execute(args, context) {
+        const path = rawPath(args);
+        const result = await run({ op: "read", path }, context);
+        return { content: renderRead(result.content, args) };
+      },
+    },
+    write: {
+      ...write,
+      async execute(args, context) {
+        const path = rawPath(args);
+        const content = args.content;
+        if (typeof content !== "string") {
+          throw new Error("content must be a string");
         }
-      : bash;
+        const result = await run({ op: "write", path, content }, context);
+        return { content: result.content };
+      },
+    },
+    edit: {
+      ...edit,
+      async execute(args, context) {
+        const path = rawPath(args);
+        const oldText = args.oldText;
+        const newText = args.newText;
+        if (typeof oldText !== "string" || oldText === "") {
+          throw new Error("oldText must be a non-empty string");
+        }
+        if (typeof newText !== "string") {
+          throw new Error("newText must be a string");
+        }
+        const result = await run(
+          { op: "edit", path, oldText, newText },
+          context,
+        );
+        return { content: result.content };
+      },
+    },
+  };
+}
+
+export function createToolRunner(options: ToolRunnerOptions = {}): ToolRunner {
+  const docker = options.sandbox === "docker";
+  const fileTools = docker
+    ? dockerFileTools(options)
+    : { read, write, edit };
+  const bashTool = docker
+    ? {
+        ...bash,
+        async execute(args: JsonObject, context: ToolContext) {
+          const command = args.command;
+          if (typeof command !== "string" || command.trim() === "") {
+            throw new Error("command must be a non-empty string");
+          }
+          const timeout = Math.min(
+            600_000,
+            typeof args.timeout === "number" && args.timeout > 0
+              ? args.timeout
+              : DEFAULT_TIMEOUT_MS,
+          );
+          return runDockerShell(
+            command,
+            context,
+            timeout,
+            dockerSandboxOptions(options),
+          );
+        },
+      }
+    : bash;
   const approvals = options.approvals ?? "allow";
   // `ask` exposes every tool: the engine pauses before bash/write/edit and
   // waits for the journaled decision instead of removing the tool.
   const allowed =
     approvals === "read-only"
-      ? [read]
+      ? [fileTools.read]
       : approvals === "deny-bash"
-        ? [read, write, edit]
-        : [read, write, edit, bashTool];
+        ? [fileTools.read, fileTools.write, fileTools.edit]
+        : [fileTools.read, fileTools.write, fileTools.edit, bashTool];
   const tools = allowed;
   const implementations = new Map(
     tools.map((tool) => [tool.name, tool] as const),

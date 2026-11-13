@@ -18,7 +18,7 @@ Properties already true:
 - Durable jobs with leases; API and worker are separate processes.
 - Committed `pi.live`; API polls a conversation version.
 - Auth and cancellation through settings, not shared memory.
-- 61 tests, including two workers, crash resume, abort, Postgres RLS/token isolation, and a purity-checked engine package.
+- 71 tests, including two workers, crash resume, abort, Postgres RLS/token isolation, and a purity-checked engine package.
 
 What is still local-only:
 
@@ -220,7 +220,7 @@ Threats:
 
 | Phase | Scope | Exit criteria |
 | --- | --- | --- |
-| 4A | Steer/queue, per-conversation idempotency, guarded states, live auth, write-amplification cuts | 61 tests, live split |
+| 4A | Steer/queue, per-conversation idempotency, guarded states, live auth, write-amplification cuts | 71 tests, live split |
 | 4B | Multi-conversation, forks, compaction, search | real UI, migration tests |
 | 4C | Postgres `StorageV2`, fencing tokens, worker pool, object storage | conformance suite, two-worker chaos |
 | 4D | Sandbox runner (container first, microVM later), egress policy, approvals | escape tests, resource-limit tests |

@@ -213,61 +213,86 @@ export class Engine {
     return new Conversation(this, await this.storage.ensureRoot());
   }
 
+  /**
+   * Summarize older entries into a `pi.compaction` boundary. The provider
+   * stream runs under an abort controller registered in the engine's abort map,
+   * so `abortAll()`, `loseLease()`, an explicit `signal`, or worker shutdown all
+   * cancel it before a summary is journaled.
+   */
   async compact(
     conversationId: number,
-    signal: AbortSignal = new AbortController().signal,
+    signal?: AbortSignal,
     isLeaseValid?: () => Awaitable<boolean>,
   ): Promise<number | undefined> {
-    if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
-    const { entries } = await this.storage.entries(
-      conversationId,
-      this.maxWindowEntries,
-    );
-    const keep = Math.min(this.compactionKeepEntries, entries.length - 1);
-    if (keep < 1) return undefined;
-    const cutoff = entries[entries.length - keep - 1];
-    if (!cutoff) return undefined;
-    const messages: ModelMessage[] = [];
-    for (const entry of entries) {
-      if (entry.id > cutoff.id) break;
-      if (entry.kind === "pi.compaction") continue;
-      if (entry.model) messages.push(...entry.model);
+    const existing = this.aborts.get(conversationId);
+    const controller = existing ?? new AbortController();
+    const owned = !existing;
+    if (owned) this.aborts.set(conversationId, controller);
+    const forwardAbort = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) controller.abort();
+      else signal.addEventListener("abort", forwardAbort, { once: true });
     }
-    if (messages.length === 0) return undefined;
-
-    let summary = "";
-    for await (const event of this.provider.stream({
-      model: this.model.modelId,
-      system:
-        "Summarize this coding-agent conversation for an agent that must continue it. " +
-        "Preserve goals, decisions, files changed, commands and test results, open issues, " +
-        "and exact identifiers. Be concise but complete.",
-      messages,
-      tools: [],
-      maxTokens: 2048,
-      signal,
-    })) {
-      if (event.type === "text") summary += event.text;
-    }
-    summary = summary.trim();
-    if (summary === "") return undefined;
-    if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
-
-    const entryId = await this.storage.tx(async () =>
-      await this.storage.appendEntry({
+    const effective = controller.signal;
+    try {
+      if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+      const { entries } = await this.storage.entries(
         conversationId,
-        kind: "pi.compaction",
-        data: {
-          summary: summary.slice(0, 16_000),
-          coversUpTo: cutoff.id,
-        },
-      }),
-    );
-    await this.emit(conversationId);
-    this.log(
-      `compacted conversation=${conversationId} upTo=${cutoff.id} entry=${entryId}`,
-    );
-    return entryId;
+        this.maxWindowEntries,
+      );
+      const keep = Math.min(this.compactionKeepEntries, entries.length - 1);
+      if (keep < 1) return undefined;
+      const cutoff = entries[entries.length - keep - 1];
+      if (!cutoff) return undefined;
+      const messages: ModelMessage[] = [];
+      for (const entry of entries) {
+        if (entry.id > cutoff.id) break;
+        if (entry.kind === "pi.compaction") continue;
+        if (entry.model) messages.push(...entry.model);
+      }
+      if (messages.length === 0) return undefined;
+
+      let summary = "";
+      for await (const event of this.provider.stream({
+        model: this.model.modelId,
+        system:
+          "Summarize this coding-agent conversation for an agent that must continue it. " +
+          "Preserve goals, decisions, files changed, commands and test results, open issues, " +
+          "and exact identifiers. Be concise but complete.",
+        messages,
+        tools: [],
+        maxTokens: 2048,
+        signal: effective,
+      })) {
+        if (effective.aborted) throw abortError();
+        if (event.type === "text") summary += event.text;
+      }
+      if (effective.aborted) throw abortError();
+      summary = summary.trim();
+      if (summary === "") return undefined;
+      if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
+
+      const entryId = await this.storage.tx(async () =>
+        await this.storage.appendEntry({
+          conversationId,
+          kind: "pi.compaction",
+          data: {
+            summary: summary.slice(0, 16_000),
+            coversUpTo: cutoff.id,
+          },
+        }),
+      );
+      await this.emit(conversationId);
+      this.log(
+        `compacted conversation=${conversationId} upTo=${cutoff.id} entry=${entryId}`,
+      );
+      return entryId;
+    } finally {
+      if (signal) signal.removeEventListener("abort", forwardAbort);
+      if (owned && this.aborts.get(conversationId) === controller) {
+        this.aborts.delete(conversationId);
+      }
+    }
   }
 
   async listConversations() {

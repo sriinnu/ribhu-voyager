@@ -9,6 +9,7 @@ import type {
   JsonObject,
   ModelMessage,
   QueueJob,
+  SettingPair,
   SubmissionRow,
   SubmissionStatus,
   Storage,
@@ -801,6 +802,18 @@ export class PostgresStorage implements Storage {
        ON CONFLICT(tenant_id, key) DO UPDATE SET value = excluded.value`,
       [this.tenantId, key, value],
     );
+  }
+
+  async settingsMatching(prefix: string): Promise<SettingPair[]> {
+    // Prefix match without LIKE escaping; RLS scopes rows to this tenant.
+    const result = await this.db().query(
+      "SELECT key, value FROM settings WHERE left(key, length($1)) = $1 ORDER BY key",
+      [prefix],
+    );
+    return result.rows.map((row) => ({
+      key: String(row.key),
+      value: String(row.value),
+    }));
   }
 
   async requestCancel(conversationId: number): Promise<void> {

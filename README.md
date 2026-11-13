@@ -316,7 +316,9 @@ remembers that exact tool + arguments for the conversation. `deny-bash` removes 
 
 ### Sandboxed execution
 
-`read`, `write`, and `edit` are contained to `RIBBHU_WORKSPACE`. `bash` can run in Docker:
+`read`, `write`, and `edit` are contained to `RIBBHU_WORKSPACE`. With `RIBBHU_SANDBOX=docker`,
+`bash` and the file tools all execute inside the hardened container (workspace-only mount, no
+network, read-only root, no host env):
 
 ```bash
 RIBBHU_SANDBOX=docker RIBBHU_SANDBOX_IMAGE=node:24-bookworm RIBBHU_WORKSPACE=~/code/my-repo npm start
@@ -409,7 +411,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 ## Tests and development
 
 ```bash
-npm test          # 61 tests
+npm test          # 71 tests
 npm run typecheck
 npm run build
 npm run dev
@@ -497,8 +499,9 @@ next step. See [docs/ARCHITECTURE-UPGRADE.md](docs/ARCHITECTURE-UPGRADE.md) and 
 - **Approvals are single-user and non-cryptographic.** `ask` pauses risky tools, survives restart, and
   can remember an exact call, but there is no approver role, rule-management UI, push notification,
   or signed audit trail.
-- **Native is a foundation.** The Capacitor config and PKCE helpers exist; no iOS/Android project,
-  OAuth exchange backend, secure token storage, or push notifications have been generated.
+- **Native is a foundation.** Configurable gateway, deep-link parsing, local approval notifications,
+  and a token-storage seam exist; no iOS/Android project, OAuth exchange, secure native storage,
+  or server push has been generated.
 - **Single SQLite writer.** One gateway/worker pair per data directory. Postgres supports multiple
   workers with leases and fences.
 - **No billing, quotas, usage events, or audit dashboards.** Usage is a per-conversation doc.

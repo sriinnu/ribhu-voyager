@@ -9,14 +9,17 @@ import {
 import type { ReactNode } from "react";
 
 import { Markdown } from "./Markdown";
+import { SettingsPanel } from "./SettingsPanel";
 import {
   approvalPreview,
   buildTimeline,
   busyOf,
   modelOf,
+  pendingApprovals,
   type Block,
   type Item,
 } from "./format";
+import { notifyPendingApproval } from "./notifications";
 import { session, type ApprovalDecision, type Status } from "./session";
 
 type InstallPrompt = Event & {
@@ -439,6 +442,26 @@ export function App() {
     element.style.height = `${Math.min(element.scrollHeight, 132)}px`;
   }, [draft]);
 
+  // Local approval notifications: only when the user cannot see the card.
+  // notifyPendingApproval de-dupes per callId and no-ops without permission.
+  useEffect(() => {
+    if (document.visibilityState === "visible") return;
+    for (const approval of pendingApprovals(state.view)) {
+      notifyPendingApproval(approval);
+    }
+  }, [state.view]);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") return;
+      for (const approval of pendingApprovals(state.view)) {
+        notifyPendingApproval(approval);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [state.view]);
+
   const onScroll = () => {
     const element = scrollRef.current;
     if (!element) return;
@@ -475,6 +498,8 @@ export function App() {
     const payload = {
       protocol: 1,
       status: state.status,
+      gateway: state.gateway,
+      tokenConfigured: state.token !== "",
       conversationId: state.conversationId,
       cursor: state.cursor,
       entries: state.view?.entries.length ?? 0,
@@ -613,6 +638,20 @@ export function App() {
         <div className="banner banner--error" role="alert">
           <span>{state.error}</span>
           <button type="button" aria-label="Dismiss" onClick={() => setHiddenError(state.error)}>
+            <IconClose />
+          </button>
+        </div>
+      ) : null}
+
+      {state.oauth ? (
+        <div className="banner banner--oauth" role="status">
+          <span className="banner-dot" aria-hidden="true" />
+          <span>
+            {state.oauth.kind === "oauth-callback"
+              ? "Authorization code received. The native token exchange is not implemented yet."
+              : `OAuth error: ${state.oauth.error}. The native token exchange is not implemented yet.`}
+          </span>
+          <button type="button" aria-label="Dismiss" onClick={() => session.dismissOAuth()}>
             <IconClose />
           </button>
         </div>
@@ -896,6 +935,8 @@ export function App() {
             {state.view?.entries.length ?? 0} entries · cursor {state.cursor}
           </b>
         </div>
+
+        <SettingsPanel gateway={state.gateway} token={state.token} />
 
         <div className="sheet-actions">
           <button
