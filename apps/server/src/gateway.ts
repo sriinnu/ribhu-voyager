@@ -350,11 +350,15 @@ export function attachGateway(
           });
           return;
         }
-        if (message.decision !== "approve" && message.decision !== "deny") {
+        if (
+          message.decision !== "approve" &&
+          message.decision !== "deny" &&
+          message.decision !== "always"
+        ) {
           send(socket, {
             t: "error",
             code: "bad_request",
-            message: "decision must be approve or deny.",
+            message: "decision must be approve, deny, or always.",
           });
           return;
         }
@@ -370,7 +374,7 @@ export function attachGateway(
         try {
           const decided = await conversation.decideApproval(
             message.callId,
-            message.decision === "approve",
+            message.decision,
           );
           if (!decided) {
             send(socket, {

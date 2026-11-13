@@ -35,6 +35,8 @@ export type Approval = {
   status: "pending" | "approved" | "denied";
   requestedAt?: number;
   decidedAt?: number;
+  /** The decision also wrote an always-allow rule for this exact call. */
+  always: boolean;
 };
 
 export type Item =
@@ -199,6 +201,14 @@ function foldApprovals(view: WireView): {
           : previous?.requestedAt,
       decidedAt:
         typeof data.decidedAt === "number" ? data.decidedAt : previous?.decidedAt,
+      // `always` rides on the decision entry; a later plain approve/deny entry
+      // for the same call must not inherit it.
+      always:
+        data.always === true
+          ? true
+          : status === "pending"
+            ? false
+            : previous?.always ?? false,
     });
     if (!anchors.has(callId)) anchors.set(callId, entry.id);
   }
@@ -273,6 +283,11 @@ export function buildTimeline(
         if (approval && anchors.get(callId) === entry.id) {
           items.push({ kind: "approval", id: String(entry.id), approval });
         }
+        break;
+      }
+      // Always-allow rules are configuration, not conversation content: never
+      // render them as chat messages (and they are not approval cards).
+      case "pi.approval-rule": {
         break;
       }
       case "pi.user": {

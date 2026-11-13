@@ -16,6 +16,13 @@ export type ModelRef = { provider: string; modelId: string };
  */
 export type ApprovalsMode = "allow" | "deny-bash" | "read-only" | "ask";
 
+/**
+ * What the user decided about one pending `ask`-mode tool call.
+ * `always` approves it and journals a durable exact-match rule for the same
+ * tool name + arguments, so identical calls no longer prompt.
+ */
+export type ApprovalDecision = "approve" | "deny" | "always";
+
 export type SubmissionDraft = {
   type: "input";
   content: string;

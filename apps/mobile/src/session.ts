@@ -1,4 +1,5 @@
 import type {
+  ApprovalDecision,
   ClientMessage,
   ConversationSearchResult,
   ConversationSummary,
@@ -7,6 +8,8 @@ import type {
   WireView,
 } from "@ribhu-voyager/protocol";
 import { PROTOCOL_VERSION } from "@ribhu-voyager/protocol";
+
+export type { ApprovalDecision };
 
 export type OutboxState = "queued" | "sending" | "failed";
 
@@ -335,12 +338,13 @@ export class Session {
   }
 
   /**
-   * Decide a pending `pi.approval` tool call. The gateway journals the decision
-   * and it comes back through the normal view update, so there is no optimistic
-   * UI state here. Returns false when the socket cannot carry the decision yet
-   * (the caller should leave the buttons usable so the user can try again).
+   * Decide a pending `pi.approval` tool call. `always` also writes a durable
+   * always-allow rule for this exact call on the gateway. The journaled
+   * decision comes back through the normal view update, so there is no
+   * optimistic UI state here. Returns false when the socket cannot carry the
+   * decision yet (the caller should leave the buttons usable to retry).
    */
-  decideApproval(callId: string, decision: "approve" | "deny"): boolean {
+  decideApproval(callId: string, decision: ApprovalDecision): boolean {
     const conversationId = this.state.conversationId;
     if (conversationId === null || callId === "") return false;
     if (!this.welcomed || !this.socket || this.socket.readyState !== WebSocket.OPEN) {

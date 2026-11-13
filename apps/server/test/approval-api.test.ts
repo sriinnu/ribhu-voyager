@@ -9,6 +9,7 @@ import test from "node:test";
 import {
   PROTOCOL_VERSION,
   isClientMessage,
+  type ApprovalDecision,
   type ClientMessage,
   type ServerInfo,
   type ServerMessage,
@@ -148,7 +149,7 @@ function errors(message: ServerMessage, code: string, text?: string) {
   );
 }
 
-test("isClientMessage accepts the approval wire shape", () => {
+test("isClientMessage accepts every approval wire shape", () => {
   const approve: ClientMessage = {
     t: "approval",
     conversationId: 7,
@@ -160,18 +161,27 @@ test("isClientMessage accepts the approval wire shape", () => {
     callId: "call_2",
     decision: "deny",
   };
+  const always: ClientMessage = {
+    t: "approval",
+    callId: "call_3",
+    decision: "always",
+  };
 
   assert.equal(isClientMessage(approve), true);
   assert.equal(isClientMessage(deny), true);
+  assert.equal(isClientMessage(always), true);
   // The gateway receives JSON, so the exact wire round-trip must stay accepted.
   assert.equal(isClientMessage(JSON.parse(JSON.stringify(approve))), true);
+  assert.equal(isClientMessage(JSON.parse(JSON.stringify(always))), true);
   assert.equal(isClientMessage({ t: "nope" }), false);
   assert.equal(isClientMessage(null), false);
 
-  if (approve.t === "approval") {
-    // Compile-time check: the published variant exposes the fixed decision union.
-    const decision: "approve" | "deny" = approve.decision;
-    assert.equal(decision, "approve");
+  // Compile-time check: the published union includes the always-allow decision.
+  const decisions: ApprovalDecision[] = ["approve", "deny", "always"];
+  assert.deepEqual(decisions, ["approve", "deny", "always"]);
+  if (always.t === "approval") {
+    const decision: ApprovalDecision = always.decision;
+    assert.equal(decision, "always");
   }
 });
 
@@ -202,13 +212,13 @@ test("api-runtime appends one decision entry for a pending approval", { timeout:
     });
 
     assert.equal(
-      await decide("call_unknown", true),
+      await decide("call_unknown", "approve"),
       false,
       "an unknown callId is not a pending approval",
     );
 
     assert.equal(
-      await decide("call_approve", true),
+      await decide("call_approve", "approve"),
       true,
       "the pending callId is decided",
     );
@@ -225,7 +235,7 @@ test("api-runtime appends one decision entry for a pending approval", { timeout:
     assert.equal(typeof approved.decidedAt, "number");
 
     assert.equal(
-      await decide("call_approve", false),
+      await decide("call_approve", "deny"),
       false,
       "a decision is append-only and cannot be replaced",
     );
@@ -242,7 +252,7 @@ test("api-runtime appends one decision entry for a pending approval", { timeout:
         requestedAt: Date.now(),
       },
     });
-    assert.equal(await decide("call_deny", false), true);
+    assert.equal(await decide("call_deny", "deny"), true);
     entries = await approvalEntries();
     const denied = entries.at(-1)!.data as { callId?: unknown; status?: unknown };
     assert.equal(denied.callId, "call_deny");
@@ -269,7 +279,7 @@ test("api-runtime appends one decision entry for a pending approval", { timeout:
       });
     }
     assert.equal(
-      await decide("call_deep", true),
+      await decide("call_deep", "approve"),
       true,
       "a pending request beyond the first scan window is still decided",
     );
@@ -277,6 +287,46 @@ test("api-runtime appends one decision entry for a pending approval", { timeout:
     const deepDecision = deepEntries.at(-1)!.data as { callId?: unknown; status?: unknown };
     assert.equal(deepDecision.callId, "call_deep");
     assert.equal(deepDecision.status, "approved");
+
+    // `always` writes the approval decision (with the audit flag) and the
+    // durable rule in the same journal write pair.
+    await api.storage.appendEntry({
+      conversationId: conversation.id,
+      kind: "pi.approval",
+      data: {
+        callId: "call_always",
+        name: "bash",
+        // Key order deliberately differs from the canonical rule key.
+        args: { cwd: "/tmp", command: "npm test" },
+        status: "pending",
+        requestedAt: Date.now(),
+      },
+    });
+    assert.equal(await decide("call_always", "always"), true);
+    const tail = (await api.storage.entries(conversation.id, 10)).entries;
+    const alwaysDecision = tail.at(-2)!.data as {
+      callId?: unknown;
+      status?: unknown;
+      decidedAt?: unknown;
+      always?: unknown;
+    };
+    assert.equal(alwaysDecision.callId, "call_always");
+    assert.equal(alwaysDecision.status, "approved");
+    assert.equal(alwaysDecision.always, true);
+    assert.equal(typeof alwaysDecision.decidedAt, "number");
+
+    const rule = tail.at(-1)!;
+    assert.equal(rule.kind, "pi.approval-rule");
+    const ruleData = rule.data as {
+      name?: unknown;
+      argsKey?: unknown;
+      args?: unknown;
+      createdAt?: unknown;
+    };
+    assert.equal(ruleData.name, "bash");
+    assert.equal(ruleData.argsKey, '{"command":"npm test","cwd":"/tmp"}');
+    assert.deepEqual(ruleData.args, { cwd: "/tmp", command: "npm test" });
+    assert.equal(ruleData.createdAt, alwaysDecision.decidedAt);
   } finally {
     await api.close();
     await rm(dir, { recursive: true, force: true });
@@ -361,6 +411,50 @@ test("gateway decides approvals for the attached conversation", { timeout: 30_00
       errors(message, "bad_request", "decision"),
     );
     assert.ok(errors(badDecision, "bad_request", "decision"));
+
+    // `always` takes the same gateway path and journals the durable rule too.
+    await api.storage.appendEntry({
+      conversationId,
+      kind: "pi.approval",
+      data: {
+        callId: "call_always",
+        name: "bash",
+        args: { cwd: "/tmp", command: "npm test" },
+        status: "pending",
+        requestedAt: Date.now(),
+      },
+    });
+    await client.next(
+      (message) => message.t === "view" && hasApprovalStatus(message.view, "pending"),
+    );
+    client.send({
+      t: "approval",
+      conversationId,
+      callId: "call_always",
+      decision: "always",
+    });
+    const ruleView = await client.next(
+      (message) =>
+        message.t === "view" &&
+        message.view.entries.some((entry) => entry.kind === "pi.approval-rule"),
+    );
+    assert.ok(ruleView.t === "view");
+
+    const tail = (await api.storage.entries(conversationId, 10)).entries;
+    const alwaysDecision = tail
+      .filter((entry) => entry.kind === "pi.approval")
+      .at(-1)!;
+    assert.equal(
+      (alwaysDecision.data as { callId?: unknown }).callId,
+      "call_always",
+    );
+    assert.equal((alwaysDecision.data as { status?: unknown }).status, "approved");
+    assert.equal((alwaysDecision.data as { always?: unknown }).always, true);
+    const rule = tail.at(-1)!;
+    assert.equal(rule.kind, "pi.approval-rule");
+    const ruleData = rule.data as { name?: unknown; argsKey?: unknown };
+    assert.equal(ruleData.name, "bash");
+    assert.equal(ruleData.argsKey, '{"command":"npm test","cwd":"/tmp"}');
 
     // A connection that never said hello cannot decide anything.
     const detached = new TestClient(port);

@@ -308,8 +308,9 @@ the list and search, and can be restored from the Archived section.
 ### Approvals
 
 `RIBBHU_APPROVALS=ask` pauses `bash`, `write`, and `edit` for a phone approval; the pending request
-and decision are durable journal entries, so a worker restart does not lose the wait. `deny-bash`
-removes `bash`, and `read-only` exposes only `read`. See
+and decision are durable journal entries, so a worker restart does not lose the wait. "Always allow"
+remembers that exact tool + arguments for the conversation. `deny-bash` removes `bash`, and
+`read-only` exposes only `read`. See
 [docs/APPROVALS.md](docs/APPROVALS.md) and [docs/NATIVE-SHELL.md](docs/NATIVE-SHELL.md). For Postgres, tenant-scoped API tokens are enforced at the WebSocket boundary and the shared
 `RIBBHU_TOKEN` is not accepted; one tenant per deployment is the current routing model.
 
@@ -408,7 +409,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 ## Tests and development
 
 ```bash
-npm test          # 57 tests
+npm test          # 61 tests
 npm run typecheck
 npm run build
 npm run dev
@@ -493,8 +494,9 @@ next step. See [docs/ARCHITECTURE-UPGRADE.md](docs/ARCHITECTURE-UPGRADE.md) and 
   tenant runtimes. Use one deployment (or one worker/API pair) per tenant.
 - **RLS requires the right role.** A superuser or `BYPASSRLS` role silently bypasses row security.
   Provision a dedicated `NOSUPERUSER NOBYPASSRLS` app role.
-- **Approvals are single-user and non-cryptographic.** `ask` pauses risky tools and survives restart,
-  but there is no approver role, remember/always-allow, push notification, or signed audit trail.
+- **Approvals are single-user and non-cryptographic.** `ask` pauses risky tools, survives restart, and
+  can remember an exact call, but there is no approver role, rule-management UI, push notification,
+  or signed audit trail.
 - **Native is a foundation.** The Capacitor config and PKCE helpers exist; no iOS/Android project,
   OAuth exchange backend, secure token storage, or push notifications have been generated.
 - **Single SQLite writer.** One gateway/worker pair per data directory. Postgres supports multiple

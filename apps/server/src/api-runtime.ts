@@ -4,16 +4,19 @@ import { join } from "node:path";
 
 import {
   admitSubmission,
+  approvalArgsKey,
   seedConversation,
   type Awaitable,
   type ConversationSearchResult,
   type ConversationSummary,
   type ConversationView,
+  type JsonObject,
   type ModelRef,
   type Storage,
   type SubmissionDraft,
   type SubmissionInfo,
 } from "@ribhu-voyager/engine";
+import type { ApprovalDecision } from "@ribhu-voyager/protocol";
 import { Db, serializedStorage } from "@ribhu-voyager/storage-sqlite";
 import { PostgresStorage } from "@ribhu-voyager/storage-postgres";
 
@@ -32,10 +35,18 @@ export type GatewayConversation = {
   abort(): Promise<void>;
   compact(): Promise<unknown>;
   /**
-   * Answer a pending `pi.approval` request. Resolves `false` when there is no
-   * pending request for this call (stale, already decided, or never asked).
+   * Answer a pending `pi.approval` request. `always` also journals a
+   * `pi.approval-rule` so the same call auto-approves next time. Resolves
+   * `false` when there is no pending request for this call (stale, already
+   * decided, or never asked).
+   *
+   * Legacy `boolean` callers are still normalized (true -> approve,
+   * false -> deny), matching the engine's own compatibility window.
    */
-  decideApproval(callId: string, approved: boolean): Promise<boolean>;
+  decideApproval(
+    callId: string,
+    decision: ApprovalDecision | boolean,
+  ): Promise<boolean>;
 };
 
 export type GatewayAuth = {
@@ -169,16 +180,19 @@ export async function createApiRuntime(config: Config): Promise<ApiRuntime> {
       async compact() {
         await storage.enqueueCompact(conversationId);
       },
-      async decideApproval(callId, approved) {
+      async decideApproval(callId, decision) {
         // The API process has no Engine instance: the worker owns the run loop
-        // and polls the journal. Append the decision entry exactly like
-        // Engine.decideApproval does, but only when the newest `pi.approval`
-        // entry for this call is still pending. Like the engine, widen the
-        // scan window so a long transcript cannot hide the pending request.
+        // and polls the journal. Append the same journal entries as
+        // Engine.decideApproval, but only when the newest `pi.approval` entry
+        // for this call is still pending. Like the engine, widen the scan window
+        // so a long transcript cannot hide the pending request.
+        const normalized: ApprovalDecision =
+          decision === true ? "approve" : decision === false ? "deny" : decision;
         return storage.tx(async () => {
           let limit = 200;
-          let status: unknown;
-          let found = false;
+          let pending:
+            | { status: unknown; name: unknown; args: unknown }
+            | undefined;
           for (;;) {
             const { entries } = await storage.entries(conversationId, limit);
             for (let index = entries.length - 1; index >= 0; index -= 1) {
@@ -192,25 +206,69 @@ export async function createApiRuntime(config: Config): Promise<ApiRuntime> {
               ) {
                 continue;
               }
-              const approval = data as { callId?: unknown; status?: unknown };
+              const approval = data as {
+                callId?: unknown;
+                status?: unknown;
+                name?: unknown;
+                args?: unknown;
+              };
               if (approval.callId !== callId) continue;
-              status = approval.status;
-              found = true;
+              pending = {
+                status: approval.status,
+                name: approval.name,
+                args: approval.args,
+              };
               break;
             }
-            if (found || entries.length < limit) break;
+            if (pending || entries.length < limit) break;
             limit *= 2;
           }
-          if (!found || status !== "pending") return false;
+          if (pending?.status !== "pending") return false;
+
+          const approved = normalized !== "deny";
+          const always = normalized === "always";
+          const ruleName = pending.name;
+          const ruleArgs = pending.args;
+          const canWriteRule =
+            typeof ruleName === "string" &&
+            ruleName !== "" &&
+            typeof ruleArgs === "object" &&
+            ruleArgs !== null &&
+            !Array.isArray(ruleArgs);
+          const decidedAt = Date.now();
+          if (always && !canWriteRule) {
+            // Defensive parity with Engine.decideApproval: if the pending
+            // request lost its metadata, approve once instead of losing the
+            // call (the rule cannot be keyed).
+            await storage.appendEntry({
+              conversationId,
+              kind: "pi.approval",
+              data: { callId, status: "approved", decidedAt },
+            });
+            return true;
+          }
           await storage.appendEntry({
             conversationId,
             kind: "pi.approval",
             data: {
               callId,
               status: approved ? "approved" : "denied",
-              decidedAt: Date.now(),
+              decidedAt,
+              ...(always ? { always: true } : {}),
             },
           });
+          if (always) {
+            await storage.appendEntry({
+              conversationId,
+              kind: "pi.approval-rule",
+              data: {
+                name: ruleName as string,
+                argsKey: approvalArgsKey(ruleArgs as JsonObject),
+                args: ruleArgs as JsonObject,
+                createdAt: decidedAt,
+              },
+            });
+          }
           return true;
         });
       },

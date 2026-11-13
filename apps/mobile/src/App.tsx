@@ -17,7 +17,7 @@ import {
   type Block,
   type Item,
 } from "./format";
-import { session, type Status } from "./session";
+import { session, type ApprovalDecision, type Status } from "./session";
 
 type InstallPrompt = Event & {
   prompt: () => Promise<void>;
@@ -157,7 +157,7 @@ function Thinking({ text }: { text: string }) {
 function ApprovalCard({ item }: { item: Extract<Item, { kind: "approval" }> }) {
   const { approval } = item;
   const pending = approval.status === "pending";
-  const [sending, setSending] = useState<"approve" | "deny" | null>(null);
+  const [sending, setSending] = useState<ApprovalDecision | null>(null);
   const [note, setNote] = useState<string | null>(null);
 
   // Decisions come back through the journaled view update; clear the in-flight
@@ -180,7 +180,7 @@ function ApprovalCard({ item }: { item: Extract<Item, { kind: "approval" }> }) {
     return () => clearTimeout(timer);
   }, [sending]);
 
-  const decide = (decision: "approve" | "deny") => {
+  const decide = (decision: ApprovalDecision) => {
     setSending(decision);
     setNote(null);
     if (!session.decideApproval(approval.callId, decision)) {
@@ -196,6 +196,7 @@ function ApprovalCard({ item }: { item: Extract<Item, { kind: "approval" }> }) {
       : approval.status === "denied"
         ? "Denied"
         : null;
+  const alwaysAllowed = approval.always && approval.status === "approved";
 
   return (
     <section
@@ -213,23 +214,38 @@ function ApprovalCard({ item }: { item: Extract<Item, { kind: "approval" }> }) {
         {decided ? <span className="approval-badge">{decided}</span> : null}
       </div>
       {preview !== "" ? <pre className="approval-args">{preview}</pre> : null}
+      {alwaysAllowed ? (
+        <p className="approval-rule-note">
+          <span aria-hidden="true">✓</span> Always allowed for this exact call.
+        </p>
+      ) : null}
       {pending ? (
-        <div className="approval-actions" role="group" aria-label="Decide tool call">
+        <div className="approval-decisions">
+          <div className="approval-actions" role="group" aria-label="Decide tool call">
+            <button
+              type="button"
+              className="approval-approve"
+              disabled={sending !== null}
+              onClick={() => decide("approve")}
+            >
+              {sending === "approve" ? "Approving…" : "Approve"}
+            </button>
+            <button
+              type="button"
+              className="approval-deny"
+              disabled={sending !== null}
+              onClick={() => decide("deny")}
+            >
+              {sending === "deny" ? "Denying…" : "Deny"}
+            </button>
+          </div>
           <button
             type="button"
-            className="approval-approve"
+            className="approval-always"
             disabled={sending !== null}
-            onClick={() => decide("approve")}
+            onClick={() => decide("always")}
           >
-            {sending === "approve" ? "Approving…" : "Approve"}
-          </button>
-          <button
-            type="button"
-            className="approval-deny"
-            disabled={sending !== null}
-            onClick={() => decide("deny")}
-          >
-            {sending === "deny" ? "Denying…" : "Deny"}
+            {sending === "always" ? "Allowing…" : "Always allow this exact call"}
           </button>
         </div>
       ) : null}

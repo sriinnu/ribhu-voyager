@@ -75,6 +75,14 @@ export type ServerInfo = {
   auth?: AuthInfo;
 };
 
+/**
+ * How the user answered a pending `pi.approval` request.
+ *
+ * `always` is an approval plus a durable `pi.approval-rule` entry so the exact
+ * same call is auto-approved next time; `approve` and `deny` are single-shot.
+ */
+export type ApprovalDecision = "approve" | "deny" | "always";
+
 export type ClientMessage =
   | {
       t: "hello";
@@ -99,7 +107,7 @@ export type ClientMessage =
       t: "approval";
       conversationId?: number;
       callId: string;
-      decision: "approve" | "deny";
+      decision: ApprovalDecision;
     }
   | { t: "search"; query: string }
   | { t: "archive"; conversationId: number; archived: boolean }

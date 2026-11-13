@@ -765,6 +765,12 @@ a {
   overflow: hidden;
 }
 
+.approval-decisions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .approval-actions {
   display: flex;
   gap: 8px;
@@ -803,6 +809,43 @@ a {
 
 .approval-actions button:not(:disabled):active {
   filter: brightness(1.18);
+}
+
+/* Secondary but explicit: a durable rule for exactly this call's arguments. */
+.approval-always {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 12px;
+  border-radius: 11px;
+  border: 1px dashed var(--amber-line);
+  background: transparent;
+  color: var(--amber);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease, opacity 0.12s ease;
+}
+
+.approval-always:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.approval-always:not(:disabled):active {
+  background: var(--amber-soft);
+}
+
+.approval-rule-note {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.approval-rule-note span {
+  color: var(--ok);
 }
 
 .approval-note {

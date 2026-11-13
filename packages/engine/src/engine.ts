@@ -1,8 +1,10 @@
 import { admitSubmission } from "./admission.js";
+import { approvalArgsKey } from "./approval.js";
 import { seedConversation } from "./conversation.js";
 import { LeaseLost } from "./errors.js";
 import type { Awaitable, Storage, ToolRunner, ToolTaskRow } from "./ports.js";
 import type {
+  ApprovalDecision,
   ApprovalsMode,
   AssistantContent,
   AssistantMessage,
@@ -44,9 +46,27 @@ const APPROVAL_TIMEOUT_MS = 5 * 60_000;
 type ApprovalState = {
   status: "pending" | "approved" | "denied";
   requestedAt?: number;
+  /** Present on a pending request: the tool name and its exact arguments. */
+  name?: string;
+  args?: JsonObject;
+  /** Audit flags copied from the decision entry that produced this state. */
+  always?: boolean;
+  auto?: boolean;
 };
 
 type ApprovalOutcome = "approved" | "denied" | "timeout";
+
+/** Journal kind for durable "always allow this exact call" rules. */
+const APPROVAL_RULE_KIND = "pi.approval-rule";
+
+function normalizeApprovalDecision(
+  decision: ApprovalDecision | boolean,
+): ApprovalDecision {
+  // boolean is the pre-`always` call style; keep it working for existing callers.
+  if (decision === true) return "approve";
+  if (decision === false) return "deny";
+  return decision;
+}
 
 function abortError(): DOMException {
   return new DOMException("Aborted", "AbortError");
@@ -54,6 +74,10 @@ function abortError(): DOMException {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function sleepWithSignal(ms: number, signal: AbortSignal): Promise<void> {
@@ -113,9 +137,9 @@ export class Conversation {
     return this.engine.abort(this.id);
   }
 
-  /** Approve or deny an `ask`-mode tool call by its model call id. */
-  decideApproval(callId: string, approved: boolean): Promise<boolean> {
-    return this.engine.decideApproval(this.id, callId, approved);
+  /** Approve, deny, or always-allow an `ask`-mode tool call by its call id. */
+  decideApproval(callId: string, decision: ApprovalDecision): Promise<boolean> {
+    return this.engine.decideApproval(this.id, callId, decision);
   }
 
   view(): Promise<ConversationView> {
@@ -333,31 +357,77 @@ export class Engine {
   }
 
   /**
-   * Approve or deny a pending `ask`-mode tool call. The decision is journaled
-   * as a `pi.approval` entry (the newest entry wins) and the waiting run picks
-   * it up on its next poll. Returns false when there is nothing pending.
+   * Approve or deny a pending `ask`-mode tool call, or set a durable
+   * "always allow" rule for this exact call. Every decision is journaled as an
+   * immutable `pi.approval` entry (the newest entry wins); `always` also
+   * journals a `pi.approval-rule` entry in the same transaction. Returns false
+   * when there is nothing pending.
    */
   async decideApproval(
     conversationId: number,
     callId: string,
-    approved: boolean,
+    decision: ApprovalDecision | boolean,
   ): Promise<boolean> {
+    const normalized = normalizeApprovalDecision(decision);
     if (!(await this.storage.conversationExists(conversationId))) return false;
     const latest = await this.latestApproval(conversationId, callId);
     if (latest?.status !== "pending") return false;
+    const decidedAt = Date.now();
+    if (normalized === "always") {
+      // Rules need the request's tool name and exact arguments. The pending
+      // request is the newest entry for this call, so it carries both.
+      const name = latest.name;
+      const args = latest.args;
+      if (typeof name !== "string" || !args) {
+        // Defensive: fall back to a plain approval instead of losing the call.
+        await this.storage.tx(async () => {
+          await this.storage.appendEntry({
+            conversationId,
+            kind: "pi.approval",
+            data: { callId, status: "approved", decidedAt },
+          });
+        });
+        this.log(
+          `approval approved conversation=${conversationId} call=${callId} (always without request args)`,
+        );
+        return true;
+      }
+      const argsKey = approvalArgsKey(args);
+      await this.storage.tx(async () => {
+        await this.storage.appendEntry({
+          conversationId,
+          kind: "pi.approval",
+          data: { callId, status: "approved", decidedAt, always: true },
+        });
+        await this.storage.appendEntry({
+          conversationId,
+          kind: APPROVAL_RULE_KIND,
+          data: {
+            name,
+            argsKey,
+            args,
+            createdAt: decidedAt,
+          },
+        });
+      });
+      this.log(
+        `approval always conversation=${conversationId} call=${callId} tool=${name} rule=${argsKey}`,
+      );
+      return true;
+    }
     await this.storage.tx(async () => {
       await this.storage.appendEntry({
         conversationId,
         kind: "pi.approval",
         data: {
           callId,
-          status: approved ? "approved" : "denied",
-          decidedAt: Date.now(),
+          status: normalized === "approve" ? "approved" : "denied",
+          decidedAt,
         },
       });
     });
     this.log(
-      `approval ${approved ? "approved" : "denied"} conversation=${conversationId} call=${callId}`,
+      `approval ${normalized === "approve" ? "approved" : "denied"} conversation=${conversationId} call=${callId}`,
     );
     return true;
   }
@@ -1011,7 +1081,15 @@ ${data.summary}`
         const entry = entries[index]!;
         if (entry.kind !== "pi.approval") continue;
         const data = entry.data as
-          | { callId?: unknown; status?: unknown; requestedAt?: unknown }
+          | {
+              callId?: unknown;
+              status?: unknown;
+              requestedAt?: unknown;
+              name?: unknown;
+              args?: unknown;
+              always?: unknown;
+              auto?: unknown;
+            }
           | undefined;
         if (!data || data.callId !== callId) continue;
         if (
@@ -1026,7 +1104,38 @@ ${data.summary}`
           ...(typeof data.requestedAt === "number"
             ? { requestedAt: data.requestedAt }
             : {}),
+          ...(typeof data.name === "string" ? { name: data.name } : {}),
+          ...(isJsonObject(data.args) ? { args: data.args } : {}),
+          ...(data.always === true ? { always: true } : {}),
+          ...(data.auto === true ? { auto: true } : {}),
         };
+      }
+      if (entries.length < limit) return undefined;
+      limit *= 2;
+    }
+  }
+
+  /**
+   * An existing durable `always allow` rule for this exact tool name and
+   * argument object. Rules are append-only conversation journal entries, so
+   * they survive restarts and are isolated by the same tenant boundary.
+   */
+  private async matchingApprovalRule(
+    conversationId: number,
+    name: string,
+    argsKey: string,
+  ): Promise<EntryRecord | undefined> {
+    let limit = 200;
+    for (;;) {
+      const { entries } = await this.storage.entries(conversationId, limit);
+      for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index]!;
+        if (entry.kind !== APPROVAL_RULE_KIND) continue;
+        const data = entry.data as
+          | { name?: unknown; argsKey?: unknown }
+          | undefined;
+        if (!data || data.name !== name || data.argsKey !== argsKey) continue;
+        return entry;
       }
       if (entries.length < limit) return undefined;
       limit *= 2;
@@ -1064,6 +1173,32 @@ ${data.summary}`
 
       const latest = await this.latestApproval(conversationId, call.id);
       if (latest === undefined) {
+        // A durable "always allow" rule for exactly these arguments means this
+        // call is auto-approved: journal the audit decision and never pause.
+        const rule = await this.matchingApprovalRule(
+          conversationId,
+          call.name,
+          approvalArgsKey(call.arguments),
+        );
+        if (rule) {
+          await this.storage.tx(async () => {
+            await this.storage.appendEntry({
+              conversationId,
+              kind: "pi.approval",
+              data: {
+                callId: call.id,
+                status: "approved",
+                decidedAt: Date.now(),
+                auto: true,
+              },
+            });
+          });
+          this.log(
+            `approval auto-approved conversation=${conversationId} call=${call.id} tool=${call.name} rule=${rule.id}`,
+          );
+          await this.emit(conversationId);
+          return "approved";
+        }
         const now = Date.now();
         requestedAt = now;
         await this.storage.tx(async () => {
