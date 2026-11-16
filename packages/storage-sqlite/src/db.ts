@@ -14,7 +14,6 @@ import {
   type JsonObject,
   type ModelMessage,
   type QueueJob,
-  type Quota,
   type SettingPair,
   type Storage,
   type SubmissionOptions,
@@ -22,13 +21,16 @@ import {
   type SubmissionStatus,
   type ToolTaskRow,
   type ToolTaskStatus,
+  type Quota,
+  type QuotaReservation,
+  type QuotaReservationInput,
   type UsageEvent,
   type UsageEventInput,
   type UsagePeriod,
   type UsageSummary,
   type WriteGuard,
 } from "@ribhu-voyager/engine";
-import { StaleFence } from "@ribhu-voyager/engine";
+import { QuotaExceeded, StaleFence } from "@ribhu-voyager/engine";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -137,6 +139,31 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS audit_events_tenant_time ON audit_events(tenant_id, created_at);
+CREATE TABLE IF NOT EXISTS quota_state (
+  tenant_id TEXT PRIMARY KEY,
+  day TEXT NOT NULL,
+  month TEXT NOT NULL,
+  day_tokens INTEGER NOT NULL DEFAULT 0,
+  day_reserved_tokens INTEGER NOT NULL DEFAULT 0,
+  month_tokens INTEGER NOT NULL DEFAULT 0,
+  month_cost_micros INTEGER NOT NULL DEFAULT 0,
+  month_reserved_cost_micros INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS quota_reservations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  conversation_id INTEGER NOT NULL,
+  submission_id INTEGER,
+  tokens INTEGER NOT NULL DEFAULT 0,
+  cost_micros INTEGER NOT NULL DEFAULT 0,
+  day TEXT NOT NULL,
+  month TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS quota_reservations_submission ON quota_reservations(submission_id);
+CREATE INDEX IF NOT EXISTS quota_reservations_status ON quota_reservations(status);
 `;
 
 function parseJson<T>(value: string | null): T | undefined {
@@ -203,6 +230,55 @@ function usageEvent(row: UsageRow): UsageEvent {
   };
 }
 
+type QuotaStateRow = {
+  tenant_id: string;
+  day: string;
+  month: string;
+  day_tokens: number;
+  day_reserved_tokens: number;
+  month_tokens: number;
+  month_cost_micros: number;
+  month_reserved_cost_micros: number;
+};
+
+type QuotaReservationRow = {
+  id: number;
+  tenant_id: string;
+  conversation_id: number;
+  submission_id: number | null;
+  tokens: number;
+  cost_micros: number;
+  day: string;
+  month: string;
+  status: string;
+  created_at: number;
+  updated_at: number;
+};
+
+function utcDay(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function utcMonth(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 7);
+}
+
+function quotaReservation(row: QuotaReservationRow): QuotaReservation {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    conversationId: row.conversation_id,
+    submissionId: row.submission_id,
+    tokens: row.tokens,
+    costMicros: row.cost_micros,
+    day: row.day,
+    month: row.month,
+    status: row.status as QuotaReservation["status"],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function auditEvent(row: AuditRow): AuditEvent {
   return {
     id: row.id,
@@ -218,6 +294,8 @@ function auditEvent(row: AuditRow): AuditEvent {
 export class Db implements Storage {
   readonly db: DatabaseSync;
   private closed = false;
+  /** True while an explicit transaction (own or serialized facade) is open. */
+  private inTransaction = false;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -392,9 +470,11 @@ export class Db implements Storage {
 
   private txSync<T>(fn: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
+    this.inTransaction = true;
     try {
       const result = fn();
       this.db.exec("COMMIT");
+      this.inTransaction = false;
       return result;
     } catch (error) {
       try {
@@ -402,16 +482,23 @@ export class Db implements Storage {
       } catch {
         /* ignore rollback failure */
       }
+      this.inTransaction = false;
       throw error;
     }
   }
 
+  private withTransaction<T>(fn: () => T): T {
+    return this.inTransaction ? fn() : this.txSync(fn);
+  }
+
   begin(): void {
     this.db.exec("BEGIN IMMEDIATE");
+    this.inTransaction = true;
   }
 
   commit(): void {
     this.db.exec("COMMIT");
+    this.inTransaction = false;
   }
 
   rollback(): void {
@@ -424,9 +511,11 @@ export class Db implements Storage {
 
   async tx<T>(fn: () => Awaitable<T>): Promise<T> {
     this.db.exec("BEGIN IMMEDIATE");
+    this.inTransaction = true;
     try {
       const result = await fn();
       this.db.exec("COMMIT");
+      this.inTransaction = false;
       return result;
     } catch (error) {
       try {
@@ -1234,6 +1323,10 @@ export class Db implements Storage {
   }
 
   recordUsage(event: UsageEventInput): void {
+    const inputTokens = Math.max(0, Math.trunc(event.inputTokens));
+    const outputTokens = Math.max(0, Math.trunc(event.outputTokens));
+    const costMicros = Math.max(0, Math.trunc(event.costMicros ?? 0));
+    const createdAt = event.createdAt ?? Date.now();
     this.db
       .prepare(
         `INSERT INTO usage_events(tenant_id, conversation_id, submission_id, provider, model, input_tokens, output_tokens, cost_micros, created_at)
@@ -1245,11 +1338,173 @@ export class Db implements Storage {
         event.submissionId ?? null,
         event.provider,
         event.model,
-        Math.max(0, Math.trunc(event.inputTokens)),
-        Math.max(0, Math.trunc(event.outputTokens)),
-        Math.max(0, Math.trunc(event.costMicros ?? 0)),
-        event.createdAt ?? Date.now(),
+        inputTokens,
+        outputTokens,
+        costMicros,
+        createdAt,
       );
+    // Keep the atomic quota counters in step with the usage journal.
+    this.quotaState(createdAt);
+    this.db
+      .prepare(
+        `UPDATE quota_state
+         SET day_tokens = day_tokens + ?,
+             month_tokens = month_tokens + ?,
+             month_cost_micros = month_cost_micros + ?
+         WHERE tenant_id = ?`,
+      )
+      .run(inputTokens + outputTokens, inputTokens + outputTokens, costMicros, DEFAULT_TENANT);
+  }
+
+  private quotaState(now: number): QuotaStateRow {
+    const day = utcDay(now);
+    const month = utcMonth(now);
+    let row = this.db
+      .prepare("SELECT * FROM quota_state WHERE tenant_id = ?")
+      .get(DEFAULT_TENANT) as QuotaStateRow | undefined;
+    if (!row) {
+      this.db
+        .prepare(
+          "INSERT OR IGNORE INTO quota_state(tenant_id, day, month) VALUES(?, ?, ?)",
+        )
+        .run(DEFAULT_TENANT, day, month);
+      row = this.db
+        .prepare("SELECT * FROM quota_state WHERE tenant_id = ?")
+        .get(DEFAULT_TENANT) as QuotaStateRow;
+    }
+    if (row.day !== day) {
+      this.db
+        .prepare(
+          "UPDATE quota_state SET day = ?, day_tokens = 0, day_reserved_tokens = 0 WHERE tenant_id = ?",
+        )
+        .run(day, DEFAULT_TENANT);
+      row = { ...row, day, day_tokens: 0, day_reserved_tokens: 0 };
+    }
+    if (row.month !== month) {
+      this.db
+        .prepare(
+          "UPDATE quota_state SET month = ?, month_tokens = 0, month_cost_micros = 0, month_reserved_cost_micros = 0 WHERE tenant_id = ?",
+        )
+        .run(month, DEFAULT_TENANT);
+      row = {
+        ...row,
+        month,
+        month_tokens: 0,
+        month_cost_micros: 0,
+        month_reserved_cost_micros: 0,
+      };
+    }
+    return row;
+  }
+
+  reserveQuota(request: QuotaReservationInput): QuotaReservation | undefined {
+    const quota = this.quota();
+    if (quota.dailyTokens === null && quota.monthlyCostMicros === null) {
+      return undefined;
+    }
+    return this.withTransaction(() => {
+      const timestamp = Date.now();
+      const state = this.quotaState(timestamp);
+      const tokens = Math.max(0, Math.trunc(request.tokens));
+      const costMicros = Math.max(0, Math.trunc(request.costMicros));
+      if (quota.dailyTokens !== null) {
+        const total = state.day_tokens + state.day_reserved_tokens + tokens;
+        if (total > quota.dailyTokens) {
+          throw new QuotaExceeded(
+            `Daily token quota exceeded: ${state.day_tokens} used, ` +
+              `${state.day_reserved_tokens} reserved, ${tokens} requested; ` +
+              `limit ${quota.dailyTokens}.`,
+          );
+        }
+      }
+      if (quota.monthlyCostMicros !== null) {
+        const total =
+          state.month_cost_micros + state.month_reserved_cost_micros + costMicros;
+        if (total > quota.monthlyCostMicros) {
+          throw new QuotaExceeded(
+            `Monthly cost quota exceeded: ${state.month_cost_micros} used, ` +
+              `${state.month_reserved_cost_micros} reserved, ${costMicros} requested; ` +
+              `limit ${quota.monthlyCostMicros} micros.`,
+          );
+        }
+      }
+      const info = this.db
+        .prepare(
+          `INSERT INTO quota_reservations(
+             tenant_id, conversation_id, submission_id, tokens, cost_micros,
+             day, month, status, created_at, updated_at
+           ) VALUES(?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+        )
+        .run(
+          DEFAULT_TENANT,
+          request.conversationId,
+          request.submissionId ?? null,
+          tokens,
+          costMicros,
+          state.day,
+          state.month,
+          timestamp,
+          timestamp,
+        );
+      this.db
+        .prepare(
+          `UPDATE quota_state
+           SET day_reserved_tokens = day_reserved_tokens + ?,
+               month_reserved_cost_micros = month_reserved_cost_micros + ?
+           WHERE tenant_id = ?`,
+        )
+        .run(tokens, costMicros, DEFAULT_TENANT);
+      const row = this.db
+        .prepare("SELECT * FROM quota_reservations WHERE id = ?")
+        .get(Number(info.lastInsertRowid)) as QuotaReservationRow;
+      return quotaReservation(row);
+    });
+  }
+
+  private finishQuotaReservation(
+    reservationId: number,
+    status: "committed" | "released",
+  ): void {
+    this.withTransaction(() => {
+      const row = this.db
+        .prepare("SELECT * FROM quota_reservations WHERE id = ?")
+        .get(reservationId) as QuotaReservationRow | undefined;
+      if (!row || row.status !== "active") return;
+      const timestamp = Date.now();
+      const state = this.quotaState(timestamp);
+      const dayTokens = row.day === state.day ? row.tokens : 0;
+      const monthCost = row.month === state.month ? row.cost_micros : 0;
+      this.db
+        .prepare(
+          `UPDATE quota_state
+           SET day_reserved_tokens = MAX(0, day_reserved_tokens - ?),
+               month_reserved_cost_micros = MAX(0, month_reserved_cost_micros - ?)
+           WHERE tenant_id = ?`,
+        )
+        .run(dayTokens, monthCost, DEFAULT_TENANT);
+      this.db
+        .prepare(
+          "UPDATE quota_reservations SET status = ?, updated_at = ? WHERE id = ? AND status = 'active'",
+        )
+        .run(status, timestamp, reservationId);
+    });
+  }
+
+  releaseQuota(reservationId: number): void {
+    this.finishQuotaReservation(reservationId, "released");
+  }
+
+  commitQuota(reservationId: number): void {
+    this.finishQuotaReservation(reservationId, "committed");
+  }
+
+  quotaReservationFor(submissionId: number): QuotaReservation | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM quota_reservations WHERE submission_id = ? ORDER BY id DESC LIMIT 1",
+      )
+      .get(submissionId) as QuotaReservationRow | undefined;
+    return row ? quotaReservation(row) : undefined;
   }
 
   usageSummary(period: UsagePeriod): UsageSummary {

@@ -129,7 +129,7 @@ test(
       for (let attempt = 0; attempt < 240 && !connected; attempt += 1) {
         const probe = new PostgresStorage(URL);
         try {
-          await probe.init();
+          await probe.init({ migrate: true });
           connected = true;
         } catch {
           await sleep(250);

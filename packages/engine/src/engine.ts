@@ -1,7 +1,14 @@
 import { admitSubmission } from "./admission.js";
 import { approvalArgsKey } from "./approval.js";
+import {
+  DEFAULT_RUN_TOKEN_BUDGET,
+  costMicrosForUsage,
+  reservationForRun,
+  type ModelPricing,
+  type RunBudget,
+} from "./quota.js";
 import { seedConversation } from "./conversation.js";
-import { LeaseLost } from "./errors.js";
+import { LeaseLost, RunBudgetExceeded } from "./errors.js";
 import type {
   Awaitable,
   Storage,
@@ -120,10 +127,19 @@ export type EngineOptions = {
   /** Tool policy. `ask` pauses before bash/write/edit for a journaled decision. */
   approvals?: ApprovalsMode;
   /**
-   * Cost charged for one model turn, in millionths of a currency unit. The
-   * worker derives it from the configured rate; defaults to 0 (unknown).
+   * Per-model pricing. When set, one turn's cost is derived from it unless an
+   * explicit `costMicros` function is supplied. Defaults to 0 (unknown).
+   */
+  pricing?: ModelPricing;
+  /**
+   * Cost charged for one model turn, in millionths of a currency unit. Wins
+   * over `pricing` when both are set; defaults to 0 (unknown).
    */
   costMicros?: (usage: Usage) => number;
+  /** Max tokens one run may consume; enforced before every model turn. */
+  tokenBudget?: number;
+  /** Max cost (micros) one run may spend; enforced before every model turn. */
+  costBudgetMicros?: number;
   /** Called once when a new approval request is journaled (push notification hook). */
   onApprovalRequest?: (
     conversationId: number,
@@ -187,7 +203,10 @@ export class Engine {
   private readonly compactionThresholdChars: number;
   private readonly compactionKeepEntries: number;
   private readonly approvals: ApprovalsMode;
+  private readonly pricing?: ModelPricing;
   private readonly costMicros: (usage: Usage) => number;
+  private readonly tokenBudget: number;
+  private readonly costBudgetMicros: number;
   private readonly onApprovalRequest?: EngineOptions["onApprovalRequest"];
   private readonly autoRun: boolean;
   private readonly recoverOnOpen: boolean;
@@ -221,7 +240,18 @@ export class Engine {
     this.compactionThresholdChars = options.compactionThresholdChars ?? 240_000;
     this.compactionKeepEntries = options.compactionKeepEntries ?? 12;
     this.approvals = options.approvals ?? "allow";
-    this.costMicros = options.costMicros ?? (() => 0);
+    this.pricing = options.pricing;
+    this.costMicros =
+      options.costMicros ??
+      ((usage) => costMicrosForUsage(usage, this.pricing));
+    this.tokenBudget =
+      options.tokenBudget !== undefined
+        ? Math.max(0, Math.trunc(options.tokenBudget))
+        : DEFAULT_RUN_TOKEN_BUDGET;
+    this.costBudgetMicros =
+      options.costBudgetMicros !== undefined
+        ? Math.max(0, Math.trunc(options.costBudgetMicros))
+        : 0;
     this.onApprovalRequest = options.onApprovalRequest;
     this.autoRun = options.autoRun ?? true;
     this.recoverOnOpen = options.recoverOnOpen ?? true;
@@ -403,8 +433,18 @@ export class Engine {
     await this.storage.close();
   }
 
+  /** Budget this engine reserves against the tenant quota for one run. */
+  private runBudget(): RunBudget {
+    return {
+      tokenBudget: this.tokenBudget,
+      costBudgetMicros: this.costBudgetMicros,
+    };
+  }
+
   async submit(conversationId: number, draft: SubmissionDraft): Promise<SubmissionInfo> {
-    const submission = await admitSubmission(this.storage, conversationId, draft);
+    const submission = await admitSubmission(this.storage, conversationId, draft, {
+      reservation: reservationForRun(this.runBudget(), this.pricing),
+    });
     void this.run(conversationId).catch(() => undefined);
     return submission;
   }
@@ -414,6 +454,10 @@ export class Engine {
     await this.storage.settleSubmissionIds(
       open.map((row) => row.id),
       "aborted",
+    );
+    await this.finalizeReservations(
+      open.map((row) => row.id),
+      "release",
     );
     for (const task of await this.storage.runningToolTasks(conversationId)) {
       await this.storage.finishToolTask(task.id, "Interrupted by user.", "aborted");
@@ -602,6 +646,10 @@ export class Engine {
     await this.storage.settleSubmissionIds(
       open.map((row) => row.id),
       "aborted",
+    );
+    await this.finalizeReservations(
+      open.map((row) => row.id),
+      "release",
     );
     for (const task of await this.storage.runningToolTasks(conversationId)) {
       await this.storage.finishToolTask(task.id, "Interrupted by user.", "aborted");
@@ -838,6 +886,8 @@ export class Engine {
     let settled = false;
     let lostLease = false;
     let compactedThisRun = false;
+    let runTokens = 0;
+    let runCostMicros = 0;
 
     try {
       // Mark the inputs running inside the guarded section: a worker that lost
@@ -906,6 +956,7 @@ export class Engine {
           !this.entryHasToolCalls(last)
         ) {
           await this.storage.settleSubmissionIds(inputIds, "done", { answerEntryId: last.id }, this.guard(conversationId));
+          await this.finalizeReservations(inputIds, "commit");
           settled = true;
           break;
         }
@@ -920,11 +971,26 @@ export class Engine {
           break;
         }
 
+        // Per-run budget: checked before every model turn, not only at
+        // admission. `maxTokens` is also clamped to the remaining budget.
+        const remainingTokens =
+          this.tokenBudget > 0 ? this.tokenBudget - runTokens : undefined;
+        if (remainingTokens !== undefined && remainingTokens <= 0) {
+          throw new RunBudgetExceeded(
+            `Run token budget exceeded (${runTokens} of ${this.tokenBudget} tokens).`,
+          );
+        }
+        if (this.costBudgetMicros > 0 && runCostMicros >= this.costBudgetMicros) {
+          throw new RunBudgetExceeded(
+            `Run cost budget exceeded (${runCostMicros} of ${this.costBudgetMicros} micros).`,
+          );
+        }
         const assistant = await this.generate(
           conversationId,
           messages,
           controller.signal,
           live,
+          remainingTokens,
         );
         const toolCalls = assistant.content.filter(
           (block): block is Extract<AssistantContent, { type: "toolCall" }> =>
@@ -959,6 +1025,8 @@ export class Engine {
             );
           }
         });
+        runTokens += assistant.usage.totalTokens;
+        runCostMicros += this.costMicros(assistant.usage);
         live.generation = undefined;
         await this.emit(conversationId);
 
@@ -983,6 +1051,7 @@ export class Engine {
           { answerEntryId: entryId },
           this.guard(conversationId),
         );
+        await this.finalizeReservations(inputIds, "commit");
         settled = true;
         live.run = undefined;
         break;
@@ -991,6 +1060,7 @@ export class Engine {
       if (!settled && !controller.signal.aborted && !lostLease) {
         const detail = `Stopped after ${this.maxTurns} model turns.`;
         await this.storage.settleSubmissionIds(inputIds, "failed", { error: detail }, this.guard(conversationId));
+        await this.finalizeReservations(inputIds, "release");
         live.runFailure = { reason: "turn_limit", detail };
         live.run = undefined;
         live.generation = undefined;
@@ -1010,6 +1080,7 @@ export class Engine {
         for (const task of await this.storage.runningToolTasks(conversationId)) {
           await this.storage.finishToolTask(task.id, "Interrupted by user.", "aborted", this.guard(conversationId));
         }
+        await this.finalizeReservations(inputIds, "release");
       } else {
         const message = error instanceof Error ? error.message : String(error);
         failed = message;
@@ -1019,6 +1090,10 @@ export class Engine {
           "failed",
           { error: message },
           this.guard(conversationId),
+        );
+        await this.finalizeReservations(
+          [...new Set([...inputIds, ...open.map((row) => row.id)])],
+          "release",
         );
         live.runFailure = {
           reason: "model_error",
@@ -1202,6 +1277,7 @@ ${data.summary}`
     messages: ModelMessage[],
     signal: AbortSignal,
     live: LiveState,
+    remainingTokens?: number,
   ): Promise<AssistantMessage> {
     const partial: AssistantMessage = {
       role: "assistant",
@@ -1227,7 +1303,10 @@ ${data.summary}`
       system: await this.systemPrompt(conversationId),
       messages,
       tools: [...this.runner.specs],
-      maxTokens: 8192,
+      maxTokens:
+        remainingTokens === undefined
+          ? 8192
+          : Math.min(8192, Math.max(1, remainingTokens)),
       signal,
     })) {
       if (event.type === "text") {
@@ -1735,6 +1814,29 @@ ${data.summary}`
     } finally {
       if (previous) this.writeGuards.set(conversationId, previous);
       else this.writeGuards.delete(conversationId);
+    }
+  }
+
+  /** Commit or release the quota reservations held by these submissions. */
+  private async finalizeReservations(
+    submissionIds: number[],
+    outcome: "commit" | "release",
+  ): Promise<void> {
+    for (const submissionId of new Set(submissionIds)) {
+      try {
+        const reservation = await this.storage.quotaReservationFor(submissionId);
+        if (!reservation || reservation.status !== "active") continue;
+        if (outcome === "commit") {
+          await this.storage.commitQuota(reservation.id);
+        } else {
+          await this.storage.releaseQuota(reservation.id);
+        }
+      } catch (error) {
+        this.log(
+          `quota reservation ${outcome} failed: ` +
+            (error instanceof Error ? error.message : String(error)),
+        );
+      }
     }
   }
 

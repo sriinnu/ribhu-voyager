@@ -429,7 +429,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 ## Tests and development
 
 ```bash
-npm test          # 85 tests
+npm test          # 124 tests
 npm run typecheck
 npm run build
 npm run dev

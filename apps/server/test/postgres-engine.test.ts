@@ -52,7 +52,7 @@ test(
       let connected = false;
       for (let attempt = 0; attempt < 240 && !connected; attempt += 1) {
         try {
-          await storage.init();
+          await storage.init({ migrate: true });
           connected = true;
         } catch {
           await sleep(250);

@@ -5,16 +5,20 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  Engine,
   QuotaExceeded,
   type JsonObject,
   type Provider,
   type ProviderEvent,
   type ProviderRequest,
+  type ToolRunner,
   type Usage,
 } from "@ribhu-voyager/engine";
+import { Db } from "@ribhu-voyager/storage-sqlite";
 
 import { createApiRuntime } from "../src/api-runtime.js";
 import type { Config } from "../src/config.js";
+import { createToolRunner } from "../src/tools-runtime.js";
 import { startWorker } from "../src/worker.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -224,8 +228,8 @@ test("daily token and monthly cost quotas block admission", { timeout: 30_000 },
       },
     );
 
-    // Lifting the quota admits work again.
-    await api.storage.setQuota({ monthlyCostMicros: 1_000 });
+    // Lifting the quota above the run's reservation admits work again.
+    await api.storage.setQuota({ monthlyCostMicros: 500_000 });
     await conversation.submit({
       type: "input",
       content: "after quota",
@@ -360,6 +364,270 @@ test("auth mode changes are audited", { timeout: 20_000 }, async () => {
     assert.deepEqual(changed.data, { mode: "api-key" });
   } finally {
     await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+/** Provider that always asks for the same no-op tool, with fixed usage. */
+class LoopingToolProvider implements Provider {
+  readonly id = "looping";
+  readonly model = "looping";
+
+  async *stream(): AsyncIterable<ProviderEvent> {
+    yield {
+      type: "toolCall",
+      id: `call_${Math.random().toString(36).slice(2)}`,
+      name: "noop",
+      arguments: {},
+    };
+    yield {
+      type: "done",
+      stopReason: "toolUse",
+      usage: { input: 5, output: 5, totalTokens: 10 },
+    };
+  }
+}
+
+class FailingProvider implements Provider {
+  readonly id = "failing";
+  readonly model = "failing";
+
+  async *stream(): AsyncIterable<ProviderEvent> {
+    yield { type: "error", message: "model exploded" };
+  }
+}
+
+const noopRunner: ToolRunner = {
+  specs: [
+    {
+      name: "noop",
+      description: "no-op test tool",
+      parameters: { type: "object" },
+      replaySafe: true,
+    },
+  ],
+  async execute() {
+    return { content: "ok" };
+  },
+};
+
+async function openEngine(
+  dir: string,
+  options: {
+    provider: Provider;
+    tokenBudget?: number;
+    costBudgetMicros?: number;
+    runner?: ToolRunner;
+  },
+): Promise<{ db: Db; engine: Engine }> {
+  const db = new Db(join(dir, "quota.sqlite"));
+  const engine = await Engine.open({
+    storage: db,
+    provider: options.provider,
+    runner: options.runner ?? createToolRunner(),
+    cwd: join(dir, "workspace"),
+    model: { provider: options.provider.id, modelId: options.provider.model },
+    instructions: "test",
+    autoRun: false,
+    recoverOnOpen: false,
+    tokenBudget: options.tokenBudget,
+    costBudgetMicros: options.costBudgetMicros,
+  });
+  return { db, engine };
+}
+
+async function waitForSubmissionStatus(
+  db: Db,
+  conversationId: number,
+  requestId: string,
+  statuses: string[],
+): Promise<{ status: string; error: string | null }> {
+  return waitFor(async () => {
+    const row = db.findSubmission(conversationId, requestId);
+    if (!row || !statuses.includes(row.status)) return undefined;
+    return { status: row.status, error: row.error };
+  });
+}
+
+test("per-model pricing overrides the flat rate", { timeout: 30_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ribhu-usage-model-price-"));
+  const config = configFor(dir, {
+    modelPricing: {
+      "demo/ribhu-demo": { inputMicrosPer1k: 100, outputMicrosPer1k: 200 },
+    },
+  });
+  const api = await createApiRuntime(config);
+  const worker = await startWorker(config, { provider: new FixedUsageProvider() });
+  try {
+    const conversation = await api.conversation();
+    assert.ok(conversation);
+    await conversation.submit({
+      type: "input",
+      content: "hello",
+      requestId: "model-price-1",
+      whenBusy: "steer",
+    });
+    await waitForDone(api, conversation.id, "model-price-1");
+    const [event] = await api.storage.listUsage(1);
+    // 10 input tokens at 100/1k = 1 micro; 5 output at 200/1k = 1 micro.
+    assert.equal(event?.costMicros, 2);
+  } finally {
+    await worker.close();
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent submissions at a quota boundary admit exactly one", { timeout: 30_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ribhu-usage-reserve-"));
+  const config = configFor(dir, { runTokenBudget: 100 });
+  const api = await createApiRuntime(config);
+  const worker = await startWorker(config, { provider: new FixedUsageProvider() });
+  try {
+    const conversation = await api.conversation();
+    assert.ok(conversation);
+    await api.storage.setQuota({ dailyTokens: 100 });
+
+    const outcomes = await Promise.allSettled([
+      conversation.submit({
+        type: "input",
+        content: "first",
+        requestId: "reserve-1",
+        whenBusy: "steer",
+      }),
+      conversation.submit({
+        type: "input",
+        content: "second",
+        requestId: "reserve-2",
+        whenBusy: "steer",
+      }),
+    ]);
+    const fulfilled = outcomes.filter((entry) => entry.status === "fulfilled");
+    const rejected = outcomes.filter((entry) => entry.status === "rejected");
+    assert.equal(fulfilled.length, 1, "exactly one submission wins the boundary");
+    assert.equal(rejected.length, 1);
+    assert.ok(
+      (rejected[0] as PromiseRejectedResult).reason instanceof QuotaExceeded,
+      "the loser is rejected atomically by the reservation",
+    );
+
+    const winnerIndex = outcomes.findIndex((entry) => entry.status === "fulfilled");
+    assert.notEqual(winnerIndex, -1);
+    const winnerRequestId = winnerIndex === 0 ? "reserve-1" : "reserve-2";
+    const loserRequestId = winnerIndex === 0 ? "reserve-2" : "reserve-1";
+    const admitted = (
+      outcomes[winnerIndex] as PromiseFulfilledResult<{ id: number; status: string }>
+    ).value;
+    assert.equal(
+      await api.storage.findSubmission(conversation.id, loserRequestId),
+      undefined,
+      "the rejected submission is never stored",
+    );
+    await waitForDone(api, conversation.id, winnerRequestId);
+    const reservation = await api.storage.quotaReservationFor(admitted.id);
+    assert.equal(reservation?.status, "committed");
+  } finally {
+    await worker.close();
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a run cannot exceed its per-run token budget", { timeout: 30_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ribhu-usage-run-budget-"));
+  const { db, engine } = await openEngine(dir, {
+    provider: new LoopingToolProvider(),
+    tokenBudget: 15,
+    runner: noopRunner,
+  });
+  try {
+    const conversation = await engine.root();
+    const submission = await conversation.submit({
+      type: "input",
+      content: "loop forever",
+      requestId: "budget-1",
+      whenBusy: "steer",
+    });
+    const settled = await waitForSubmissionStatus(db, conversation.id, "budget-1", [
+      "failed",
+    ]);
+    assert.equal(settled.status, "failed");
+    assert.match(settled.error ?? "", /Run token budget exceeded/);
+    const assistantTurns = db
+      .entries(conversation.id)
+      .entries.filter((entry) => entry.kind === "pi.assistant").length;
+    assert.equal(assistantTurns, 2, "the loop stops before crossing the budget again");
+    assert.ok(submission.id > 0);
+  } finally {
+    await engine.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed run releases its quota reservation", { timeout: 30_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ribhu-usage-release-"));
+  const { db, engine } = await openEngine(dir, {
+    provider: new FailingProvider(),
+    tokenBudget: 100,
+  });
+  try {
+    const conversation = await engine.root();
+    db.setQuota({ dailyTokens: 100 });
+    const submission = await conversation.submit({
+      type: "input",
+      content: "will fail",
+      requestId: "release-1",
+      whenBusy: "steer",
+    });
+    const settled = await waitForSubmissionStatus(db, conversation.id, "release-1", [
+      "failed",
+    ]);
+    assert.match(settled.error ?? "", /model exploded/);
+    const reservation = db.quotaReservationFor(submission.id);
+    assert.equal(reservation?.status, "released");
+    // The released headroom admits another run at the same boundary.
+    const next = await conversation.submit({
+      type: "input",
+      content: "after release",
+      requestId: "release-2",
+      whenBusy: "steer",
+    });
+    assert.ok(next.id > submission.id);
+  } finally {
+    await engine.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a successful run commits its reservation and records actual usage", { timeout: 30_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ribhu-usage-commit-"));
+  const { db, engine } = await openEngine(dir, {
+    provider: new FixedUsageProvider(),
+    tokenBudget: 100,
+  });
+  try {
+    const conversation = await engine.root();
+    db.setQuota({ dailyTokens: 1_000 });
+    const submission = await conversation.submit({
+      type: "input",
+      content: "succeed",
+      requestId: "commit-1",
+      whenBusy: "steer",
+    });
+    await waitForSubmissionStatus(db, conversation.id, "commit-1", ["done"]);
+    const reservation = db.quotaReservationFor(submission.id);
+    assert.equal(reservation?.status, "committed");
+    const day = db.usageSummary("day");
+    assert.equal(day.totalTokens, 15, "the actual usage is journaled");
+    // 15 committed + a 100-token reservation still fits the 1000-token quota.
+    const next = await conversation.submit({
+      type: "input",
+      content: "after commit",
+      requestId: "commit-2",
+      whenBusy: "steer",
+    });
+    assert.ok(next.id > submission.id);
+  } finally {
+    await engine.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { networkInterfaces } from "node:os";
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import { PROTOCOL_VERSION } from "@ribhu-voyager/protocol";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -9,9 +9,11 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { describeConfig, loadConfig } from "./config.js";
 import { attachGateway, createRateLimiter } from "./gateway.js";
 import {
+  PostgresStorage,
   closeApiTokenPools,
   resolveApiToken,
 } from "@ribhu-voyager/storage-postgres";
+import { Db } from "@ribhu-voyager/storage-sqlite";
 
 import type { ApiRuntime } from "./api-runtime.js";
 import { createAdminApi } from "./admin.js";
@@ -70,6 +72,59 @@ function readAdminBody(request: IncomingMessage, limit = 8_192): Promise<string>
 }
 
 const config = loadConfig();
+
+// R10: schema migrations are an explicit, schema-admin mode. `RIBBHU_MIGRATE_ONLY=1`
+// applies DDL with the admin credentials then exits; normal startup only verifies
+// the schema version (see the storage `init()` call inside the runtime/worker).
+if (config.migrateOnly) {
+  try {
+    if (config.storage === "postgres" && config.postgresUrl) {
+      const schema = new PostgresStorage(
+        config.postgresUrl,
+        config.tenantId ?? "default",
+      );
+      try {
+        const version = await schema.migrateSchema();
+        console.log(`  migrate   Postgres schema at version ${version}`);
+      } finally {
+        await schema.close().catch(() => undefined);
+      }
+    } else {
+      // Opening the local journal applies its forward-only schema changes.
+      const db = new Db(join(config.dataDir, "ribhu.sqlite"));
+      db.close();
+      console.log("  migrate   SQLite journal schema is up to date");
+    }
+  } catch (error) {
+    console.error(
+      `  migrate   failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+// R10: verify (never migrate) the hosted schema before serving, so a stale
+// database fails startup with the remediation message instead of a 500 later.
+if (config.storage === "postgres" && config.postgresUrl) {
+  const probe = new PostgresStorage(
+    config.postgresUrl,
+    config.tenantId ?? "default",
+  );
+  try {
+    await probe.init();
+  } catch (error) {
+    console.error(
+      `  storage   schema check failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    process.exit(1);
+  } finally {
+    await probe.close().catch(() => undefined);
+  }
+}
+
 const startedAt = Date.now();
 const hasTenantTokens = config.storage === "postgres" && Boolean(config.postgresUrl);
 

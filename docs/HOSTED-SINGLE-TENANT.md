@@ -42,6 +42,15 @@ tenant table and is only for a verified empty target.
 Jobs are not copied; the worker redispatches open submissions on boot. The migration currently lands
 data in the `default` tenant. Run it into a fresh database for a single-tenant beta.
 
+After deploying a new build, run schema migrations explicitly with admin credentials:
+
+```bash
+RIBBHU_MIGRATE_ONLY=1 RIBBHU_POSTGRES_URL="$ADMIN_URL" npm run start:api
+```
+
+Normal API/worker startup never runs DDL; it verifies the schema version and fails with a clear
+message if the database is behind.
+
 ## 3. Issue a tenant token
 
 Use the **admin** URL for token management:

@@ -3,9 +3,11 @@ import type { Storage } from "./ports.js";
 import type { SubmissionDraft, SubmissionInfo } from "./types.js";
 
 /**
- * Refuse work when the tenant has spent its daily token or monthly cost quota.
- * The limits live in tenant-scoped settings, so SQLite (one tenant) and
- * Postgres (RLS) share the same check.
+ * Legacy check-then-admit quota check. Admission now uses the atomic
+ * `Storage.reserveQuota` reservation instead; this helper is kept for callers
+ * that only want to read whether a quota is currently exhausted.
+ *
+ * @deprecated use `Storage.reserveQuota` (atomic) to admit work.
  */
 export async function enforceQuota(storage: Storage): Promise<void> {
   const quota = await storage.quota();
@@ -28,13 +30,24 @@ export async function enforceQuota(storage: Storage): Promise<void> {
   }
 }
 
+export type AdmitSubmissionOptions = {
+  /**
+   * Per-run budget to reserve atomically against the tenant quota. Omitted
+   * callers (embedded/no-budget paths) still get the plain admission.
+   */
+  reservation?: { tokens: number; costMicros: number };
+};
+
 /**
  * Durably admit an input and enqueue a run. Shared by the API and the engine.
+ * Quota is reserved atomically with the submission row, so two concurrent
+ * submissions at the boundary cannot both be admitted.
  */
 export async function admitSubmission(
   storage: Storage,
   conversationId: number,
   draft: SubmissionDraft,
+  options: AdmitSubmissionOptions = {},
 ): Promise<SubmissionInfo> {
   const content = draft.content.trim();
   if (content === "") throw new Error("content must be non-empty");
@@ -42,8 +55,6 @@ export async function admitSubmission(
 
   const existing = await storage.findSubmission(conversationId, draft.requestId);
   if (existing) return { id: existing.id, status: existing.status };
-
-  await enforceQuota(storage);
 
   if (draft.whenBusy === "reject" && (await storage.busy(conversationId))) {
     throw new ConversationBusy();
@@ -69,6 +80,16 @@ export async function admitSubmission(
         content,
         draft.whenBusy ?? "steer",
       );
+      if (options.reservation) {
+        // Atomic reserve (committed usage + active reservations + this run).
+        // Throwing QuotaExceeded rolls back the submission row and the entry.
+        await storage.reserveQuota({
+          conversationId,
+          submissionId: row.id,
+          tokens: options.reservation.tokens,
+          costMicros: options.reservation.costMicros,
+        });
+      }
       await storage.appendEntry({
         conversationId,
         kind: "pi.user",

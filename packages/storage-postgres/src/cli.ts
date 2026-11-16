@@ -13,7 +13,11 @@ if (!sqlitePath || !connectionString) {
 }
 if (force) {
   console.warn(
-    "--force: truncating conversations, entries, docs, submissions, jobs, tool_tasks, settings, and cancels",
+    "--force: truncating conversations, entries, docs, submissions, jobs, tool_tasks, " +
+      "settings, cancels, usage_events, audit_events, quota_state, and quota_reservations",
+  );
+  console.warn(
+    "--force: api_tokens are intentionally kept (revoke them with `npm run tokens:postgres -- revoke`)",
   );
 }
 

@@ -31,6 +31,15 @@ export class StaleFence extends LeaseLost {
   }
 }
 
+/** A run stopped because its per-run token or cost budget was exhausted. */
+export class RunBudgetExceeded extends Error {
+  readonly code = "run_budget_exceeded";
+  constructor(message: string) {
+    super(message);
+    this.name = "RunBudgetExceeded";
+  }
+}
+
 /** Admission refused because the tenant's daily token or monthly cost quota is spent. */
 export class QuotaExceeded extends Error {
   readonly code = "quota_exceeded";

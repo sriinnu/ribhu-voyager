@@ -3,8 +3,11 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
+  DEFAULT_RUN_TOKEN_BUDGET,
   admitSubmission,
   approvalArgsKey,
+  reservationForRun,
+  resolveModelPricing,
   seedConversation,
   type Awaitable,
   type ConversationSearchResult,
@@ -128,6 +131,22 @@ export async function createApiRuntime(
     ? { provider: "demo", modelId: "ribhu-demo" }
     : { provider: config.provider, modelId: config.model };
 
+  // Per-run budget reserved atomically at admission (and enforced inside the
+  // engine loop). Pricing is per-model with the flat env rate as fallback.
+  const runPricing = resolveModelPricing(
+    config.modelPricing,
+    model.provider,
+    model.modelId,
+    config.costMicrosPer1kTokens,
+  );
+  const runReservation = reservationForRun(
+    {
+      tokenBudget: config.runTokenBudget ?? DEFAULT_RUN_TOKEN_BUDGET,
+      costBudgetMicros: config.runCostMicros ?? 0,
+    },
+    runPricing,
+  );
+
   const fallbackAuth = (): AuthInfo => ({
     mode: config.authMode === "api-key" ? "api-key" : "subscription",
     ...(config.authSource === "pi" ? { source: "pi" as const } : {}),
@@ -198,7 +217,9 @@ export async function createApiRuntime(
         return () => clearInterval(timer);
       },
       async submit(draft) {
-        return admitSubmission(storage, conversationId, draft);
+        return admitSubmission(storage, conversationId, draft, {
+          reservation: runReservation,
+        });
       },
       async abort() {
         await storage.requestCancel(conversationId);

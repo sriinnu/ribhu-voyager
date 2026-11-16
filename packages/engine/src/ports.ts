@@ -157,6 +157,38 @@ export type Quota = {
 export const QUOTA_DAILY_TOKENS_KEY = "daily_tokens";
 export const QUOTA_MONTHLY_COST_KEY = "monthly_cost_micros";
 
+export type QuotaReservationStatus = "active" | "committed" | "released";
+
+export type QuotaReservationInput = {
+  conversationId: number;
+  submissionId?: number | null;
+  /** Tokens reserved for the run (its token budget). */
+  tokens: number;
+  /** Cost in micros reserved for the run (its cost estimate). */
+  costMicros: number;
+};
+
+/**
+ * A row in `quota_reservations`: the quota headroom one admitted run holds
+ * until it commits (done) or releases (failed/aborted). Reservations are what
+ * make admission atomic: concurrent submissions check committed + reserved.
+ */
+export type QuotaReservation = {
+  id: number;
+  tenantId: string;
+  conversationId: number;
+  submissionId: number | null;
+  tokens: number;
+  costMicros: number;
+  /** UTC day (`YYYY-MM-DD`) the tokens were reserved against. */
+  day: string;
+  /** UTC month (`YYYY-MM`) the cost was reserved against. */
+  month: string;
+  status: QuotaReservationStatus;
+  createdAt: number;
+  updatedAt: number;
+};
+
 /**
  * The journal boundary as implemented synchronously by SQLite. `Storage`
  * below widens every method to `Awaitable`, so the same engine can run on
@@ -235,6 +267,18 @@ export interface SyncStorage {
   quota(): Quota;
   /** Update only the provided limits; `null` clears a limit. */
   setQuota(quota: Partial<Quota>): void;
+  /**
+   * Atomically reserve quota headroom for a run. Throws `QuotaExceeded` when
+   * committed + reserved usage would cross a configured limit. Returns
+   * `undefined` when no quota is configured (nothing to release later).
+   */
+  reserveQuota(request: QuotaReservationInput): QuotaReservation | undefined;
+  /** Release an active reservation back to the quota (failed/aborted run). */
+  releaseQuota(reservationId: number): void;
+  /** Mark an active reservation committed (successful run; usage stays). */
+  commitQuota(reservationId: number): void;
+  /** Active/terminal reservation attached to a submission, if any. */
+  quotaReservationFor(submissionId: number): QuotaReservation | undefined;
   /** Tenants known to this storage (SQLite has a single default tenant). */
   listTenants(): string[];
 

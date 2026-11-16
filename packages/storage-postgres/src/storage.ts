@@ -14,6 +14,8 @@ import {
   type ModelMessage,
   type QueueJob,
   type Quota,
+  type QuotaReservation,
+  type QuotaReservationInput,
   type SettingPair,
   type Storage,
   type SubmissionRow,
@@ -26,9 +28,9 @@ import {
   type UsageSummary,
   type WriteGuard,
 } from "@ribhu-voyager/engine";
-import { StaleFence } from "@ribhu-voyager/engine";
+import { QuotaExceeded, StaleFence } from "@ribhu-voyager/engine";
 
-import { MIGRATIONS } from "./migrations.js";
+import { LATEST_SCHEMA_VERSION, MIGRATIONS } from "./migrations.js";
 
 const now = () => Date.now();
 const n = (value: unknown): number => Number(value);
@@ -48,6 +50,40 @@ function limitSetting(value: string | undefined): number | null {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : null;
 }
+
+function utcDay(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function utcMonth(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 7);
+}
+
+function quotaReservation(row: Record<string, unknown>): QuotaReservation {
+  return {
+    id: n(row.id),
+    tenantId: String(row.tenant_id),
+    conversationId: n(row.conversation_id),
+    submissionId: row.submission_id === null ? null : n(row.submission_id),
+    tokens: n(row.tokens),
+    costMicros: n(row.cost_micros),
+    day: String(row.day),
+    month: String(row.month),
+    status: String(row.status) as QuotaReservation["status"],
+    createdAt: n(row.created_at),
+    updatedAt: n(row.updated_at),
+  };
+}
+
+type QuotaStateRow = {
+  day: string;
+  month: string;
+  day_tokens: unknown;
+  day_reserved_tokens: unknown;
+  month_tokens: unknown;
+  month_cost_micros: unknown;
+  month_reserved_cost_micros: unknown;
+};
 
 function usageEvent(row: Record<string, unknown>): UsageEvent {
   return {
@@ -155,16 +191,17 @@ export class PostgresStorage implements Storage {
     }
   }
 
-  async init(): Promise<void> {
-    const lock = await this.pool.connect();
-    await lock.query("SELECT pg_advisory_lock(727274)");
-    try {
-      await this.migrate();
-    } finally {
-      await lock
-        .query("SELECT pg_advisory_unlock(727274)")
-        .catch(() => undefined);
-      lock.release();
+  /**
+   * Prepare the storage for use. By default this only *verifies* the schema
+   * version (read-only DDL check) so app credentials never run migrations.
+   * Schema-admin flows pass `{ migrate: true }` (RIBBHU_MIGRATE_ONLY / the
+   * migrate:postgres CLI) to apply pending DDL under an advisory lock.
+   */
+  async init(options: { migrate?: boolean } = {}): Promise<void> {
+    if (options.migrate === true) {
+      await this.migrateSchema();
+    } else {
+      await this.verifySchema();
     }
     await this.pool.query(
       `INSERT INTO tenants(id, name, created_at) VALUES($1, $1, $2)
@@ -183,7 +220,61 @@ export class PostgresStorage implements Storage {
     }
   }
 
-  private async migrate(): Promise<void> {
+  /** Highest applied schema version (0 when the migrations table is absent). */
+  async schemaVersion(): Promise<number> {
+    const existing = await this.pool.query(
+      "SELECT to_regclass('public.schema_migrations') AS name",
+    );
+    if (existing.rows[0]?.name === null) return 0;
+    const applied = await this.pool.query(
+      "SELECT COALESCE(MAX(version), 0)::int AS version FROM schema_migrations",
+    );
+    return n(applied.rows[0]?.version);
+  }
+
+  /** Fail clearly when the database schema is behind this build (no DDL). */
+  async verifySchema(): Promise<void> {
+    const version = await this.schemaVersion();
+    if (version === LATEST_SCHEMA_VERSION) return;
+    if (version > LATEST_SCHEMA_VERSION) {
+      throw new Error(
+        `Database schema version ${version} is newer than this build ` +
+          `(${LATEST_SCHEMA_VERSION}). Upgrade Ribhu Voyager before starting.`,
+      );
+    }
+    throw new Error(
+      `Database schema is behind: version ${version}, expected ${LATEST_SCHEMA_VERSION}. ` +
+        "Run migrations with schema-admin credentials first: " +
+        "RIBBHU_MIGRATE_ONLY=1 RIBBHU_STORAGE=postgres RIBBHU_POSTGRES_URL=... npm run start:api " +
+        "(or the migrate:postgres CLI). The app credential is verified read-only and never runs DDL.",
+    );
+  }
+
+  /**
+   * Apply pending DDL migrations under the global advisory lock. Requires
+   * schema-admin credentials; the application role must not own tables.
+   */
+  async migrateSchema(): Promise<number> {
+    const lock = await this.pool.connect();
+    await lock.query("SELECT pg_advisory_lock(727274)");
+    try {
+      await this.applyMigrations();
+      const version = await this.schemaVersion();
+      if (version !== LATEST_SCHEMA_VERSION) {
+        throw new Error(
+          `Migration run finished at schema version ${version}, expected ${LATEST_SCHEMA_VERSION}.`,
+        );
+      }
+      return version;
+    } finally {
+      await lock
+        .query("SELECT pg_advisory_unlock(727274)")
+        .catch(() => undefined);
+      lock.release();
+    }
+  }
+
+  private async applyMigrations(): Promise<void> {
     const existing = await this.pool.query(
       "SELECT to_regclass('public.schema_migrations') AS name",
     );
@@ -959,6 +1050,10 @@ export class PostgresStorage implements Storage {
   }
 
   async recordUsage(event: UsageEventInput): Promise<void> {
+    const inputTokens = Math.max(0, Math.trunc(event.inputTokens));
+    const outputTokens = Math.max(0, Math.trunc(event.outputTokens));
+    const costMicros = Math.max(0, Math.trunc(event.costMicros ?? 0));
+    const createdAt = event.createdAt ?? now();
     await this.db().query(
       `INSERT INTO usage_events(tenant_id, conversation_id, submission_id, provider, model,
                                  input_tokens, output_tokens, cost_micros, created_at)
@@ -969,11 +1064,21 @@ export class PostgresStorage implements Storage {
         event.submissionId ?? null,
         event.provider,
         event.model,
-        Math.max(0, Math.trunc(event.inputTokens)),
-        Math.max(0, Math.trunc(event.outputTokens)),
-        Math.max(0, Math.trunc(event.costMicros ?? 0)),
-        event.createdAt ?? now(),
+        inputTokens,
+        outputTokens,
+        costMicros,
+        createdAt,
       ],
+    );
+    // Keep the row-locked quota counters in step with the usage journal.
+    await this.quotaState(createdAt);
+    await this.db().query(
+      `UPDATE quota_state
+       SET day_tokens = day_tokens + $1,
+           month_tokens = month_tokens + $1,
+           month_cost_micros = month_cost_micros + $2
+       WHERE tenant_id = $3`,
+      [inputTokens + outputTokens, costMicros, this.tenantId],
     );
   }
 
@@ -1068,6 +1173,157 @@ export class PostgresStorage implements Storage {
   async listTenants(): Promise<string[]> {
     const result = await this.db().query("SELECT id FROM tenants ORDER BY id");
     return result.rows.map((row) => String(row.id));
+  }
+
+  private async inTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    return this.txContext.getStore() ? await fn() : await this.tx(fn);
+  }
+
+  /** Row-locked quota counters for the current UTC day/month. */
+  private async quotaState(timestamp: number): Promise<QuotaStateRow> {
+    const day = utcDay(timestamp);
+    const month = utcMonth(timestamp);
+    await this.db().query(
+      `INSERT INTO quota_state(tenant_id, day, month) VALUES($1, $2, $3)
+       ON CONFLICT(tenant_id) DO NOTHING`,
+      [this.tenantId, day, month],
+    );
+    const result = await this.db().query(
+      "SELECT * FROM quota_state WHERE tenant_id = $1 FOR UPDATE",
+      [this.tenantId],
+    );
+    let row = result.rows[0]! as QuotaStateRow;
+    if (row.day !== day) {
+      await this.db().query(
+        `UPDATE quota_state SET day = $1, day_tokens = 0, day_reserved_tokens = 0
+         WHERE tenant_id = $2`,
+        [day, this.tenantId],
+      );
+      row = { ...row, day, day_tokens: 0, day_reserved_tokens: 0 };
+    }
+    if (row.month !== month) {
+      await this.db().query(
+        `UPDATE quota_state
+         SET month = $1, month_tokens = 0, month_cost_micros = 0, month_reserved_cost_micros = 0
+         WHERE tenant_id = $2`,
+        [month, this.tenantId],
+      );
+      row = {
+        ...row,
+        month,
+        month_tokens: 0,
+        month_cost_micros: 0,
+        month_reserved_cost_micros: 0,
+      };
+    }
+    return row;
+  }
+
+  async reserveQuota(
+    request: QuotaReservationInput,
+  ): Promise<QuotaReservation | undefined> {
+    const quota = await this.quota();
+    if (quota.dailyTokens === null && quota.monthlyCostMicros === null) {
+      return undefined;
+    }
+    return await this.inTransaction(async () => {
+      const timestamp = now();
+      const state = await this.quotaState(timestamp);
+      const tokens = Math.max(0, Math.trunc(request.tokens));
+      const costMicros = Math.max(0, Math.trunc(request.costMicros));
+      if (quota.dailyTokens !== null) {
+        const total = n(state.day_tokens) + n(state.day_reserved_tokens) + tokens;
+        if (total > quota.dailyTokens) {
+          throw new QuotaExceeded(
+            `Daily token quota exceeded: ${n(state.day_tokens)} used, ` +
+              `${n(state.day_reserved_tokens)} reserved, ${tokens} requested; ` +
+              `limit ${quota.dailyTokens}.`,
+          );
+        }
+      }
+      if (quota.monthlyCostMicros !== null) {
+        const total =
+          n(state.month_cost_micros) + n(state.month_reserved_cost_micros) + costMicros;
+        if (total > quota.monthlyCostMicros) {
+          throw new QuotaExceeded(
+            `Monthly cost quota exceeded: ${n(state.month_cost_micros)} used, ` +
+              `${n(state.month_reserved_cost_micros)} reserved, ${costMicros} requested; ` +
+              `limit ${quota.monthlyCostMicros} micros.`,
+          );
+        }
+      }
+      const inserted = await this.db().query(
+        `INSERT INTO quota_reservations(
+           tenant_id, conversation_id, submission_id, tokens, cost_micros,
+           day, month, status, created_at, updated_at
+         ) VALUES($1, $2, $3, $4, $5, $6, $7, 'active', $8, $8) RETURNING *`,
+        [
+          this.tenantId,
+          request.conversationId,
+          request.submissionId ?? null,
+          tokens,
+          costMicros,
+          state.day,
+          state.month,
+          timestamp,
+        ],
+      );
+      await this.db().query(
+        `UPDATE quota_state
+         SET day_reserved_tokens = day_reserved_tokens + $1,
+             month_reserved_cost_micros = month_reserved_cost_micros + $2
+         WHERE tenant_id = $3`,
+        [tokens, costMicros, this.tenantId],
+      );
+      return quotaReservation(inserted.rows[0]!);
+    });
+  }
+
+  private async finishQuotaReservation(
+    reservationId: number,
+    status: "committed" | "released",
+  ): Promise<void> {
+    await this.inTransaction(async () => {
+      const found = await this.db().query(
+        "SELECT * FROM quota_reservations WHERE id = $1 FOR UPDATE",
+        [reservationId],
+      );
+      const row = found.rows[0];
+      if (!row || String(row.status) !== "active") return;
+      const timestamp = now();
+      const state = await this.quotaState(timestamp);
+      const dayTokens = String(row.day) === state.day ? n(row.tokens) : 0;
+      const monthCost = String(row.month) === state.month ? n(row.cost_micros) : 0;
+      await this.db().query(
+        `UPDATE quota_state
+         SET day_reserved_tokens = GREATEST(0, day_reserved_tokens - $1),
+             month_reserved_cost_micros = GREATEST(0, month_reserved_cost_micros - $2)
+         WHERE tenant_id = $3`,
+        [dayTokens, monthCost, this.tenantId],
+      );
+      await this.db().query(
+        "UPDATE quota_reservations SET status = $1, updated_at = $2 WHERE id = $3 AND status = 'active'",
+        [status, timestamp, reservationId],
+      );
+    });
+  }
+
+  async releaseQuota(reservationId: number): Promise<void> {
+    await this.finishQuotaReservation(reservationId, "released");
+  }
+
+  async commitQuota(reservationId: number): Promise<void> {
+    await this.finishQuotaReservation(reservationId, "committed");
+  }
+
+  async quotaReservationFor(
+    submissionId: number,
+  ): Promise<QuotaReservation | undefined> {
+    const result = await this.db().query(
+      "SELECT * FROM quota_reservations WHERE submission_id = $1 ORDER BY id DESC LIMIT 1",
+      [submissionId],
+    );
+    return result.rows[0] ? quotaReservation(result.rows[0]) : undefined;
   }
 
   async requestCancel(conversationId: number): Promise<void> {

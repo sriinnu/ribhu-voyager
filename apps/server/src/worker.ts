@@ -4,7 +4,9 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
+  DEFAULT_RUN_TOKEN_BUDGET,
   Engine,
+  resolveModelPricing,
   type Conversation,
   type ModelRef,
   type Provider,
@@ -114,10 +116,14 @@ export async function startWorker(
     instructions: INSTRUCTIONS,
     maxWindowEntries: config.maxWindowEntries,
     approvals: config.approvals ?? "allow",
-    costMicros: (usage) =>
-      Math.round(
-        ((usage.input + usage.output) * (config.costMicrosPer1kTokens ?? 0)) / 1000,
-      ),
+    pricing: resolveModelPricing(
+      config.modelPricing,
+      model.provider,
+      model.modelId,
+      config.costMicrosPer1kTokens,
+    ),
+    tokenBudget: config.runTokenBudget ?? DEFAULT_RUN_TOKEN_BUDGET,
+    costBudgetMicros: config.runCostMicros ?? 0,
     onApprovalRequest: (conversationId, request) =>
       push.notify({ conversationId, ...request }),
     autoRun: false,

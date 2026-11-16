@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { ApprovalsMode } from "@ribhu-voyager/engine";
+import type { ApprovalsMode, ModelPricing } from "@ribhu-voyager/engine";
 
 export type Config = {
   host: string;
@@ -37,6 +37,14 @@ export type Config = {
   adminToken?: string;
   /** Usage pricing in micros per 1k tokens; 0/absent records zero cost. */
   costMicrosPer1kTokens?: number;
+  /** Per-model pricing (`provider/model` -> micros per 1k tokens). */
+  modelPricing?: Record<string, ModelPricing>;
+  /** Max tokens a single run may consume (per-run budget). */
+  runTokenBudget?: number;
+  /** Max cost in micros a single run may spend; 0 disables the cap. */
+  runCostMicros?: number;
+  /** `RIBBHU_MIGRATE_ONLY=1`: apply DDL migrations and exit. */
+  migrateOnly?: boolean;
   /**
    * R1: allow a token-less runtime on loopback. Off by default; when off and no
    * `RIBBHU_TOKEN` is configured, startup generates and prints one.
@@ -55,6 +63,62 @@ export type Config = {
   /** True when startup generated a token instead of reading RIBBHU_TOKEN. */
   tokenGenerated?: boolean;
 };
+
+function parseNonNegativeInt(
+  raw: string | undefined,
+  name: string,
+  fallback: number,
+): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
+    throw new Error(`${name} must be a non-negative integer.`);
+  }
+  return value;
+}
+
+function parseModelPricing(
+  raw: string | undefined,
+): Record<string, ModelPricing> | undefined {
+  if (raw === undefined || raw.trim() === "") return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      "RIBBHU_MODEL_PRICING must be JSON: {\"provider/model\": {\"inputMicrosPer1k\":N,\"outputMicrosPer1k\":N}}.",
+    );
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("RIBBHU_MODEL_PRICING must be a JSON object keyed by provider/model.");
+  }
+  const result: Record<string, ModelPricing> = {};
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!key.includes("/")) {
+      throw new Error(`RIBBHU_MODEL_PRICING entry "${key}" must be "provider/model".`);
+    }
+    const rate = (candidate: unknown, field: string): number => {
+      if (typeof candidate !== "number" || !Number.isFinite(candidate) || candidate < 0) {
+        throw new Error(`RIBBHU_MODEL_PRICING ${key}.${field} must be a non-negative number.`);
+      }
+      return candidate;
+    };
+    if (typeof value === "number") {
+      const flat = rate(value, "rate");
+      result[key] = { inputMicrosPer1k: flat, outputMicrosPer1k: flat };
+      continue;
+    }
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`RIBBHU_MODEL_PRICING ${key} must be a number or an object.`);
+    }
+    const entry = value as { inputMicrosPer1k?: unknown; outputMicrosPer1k?: unknown };
+    result[key] = {
+      inputMicrosPer1k: rate(entry.inputMicrosPer1k, "inputMicrosPer1k"),
+      outputMicrosPer1k: rate(entry.outputMicrosPer1k, "outputMicrosPer1k"),
+    };
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
 
 // Resolve against the repository, not the caller's cwd: npm workspace scripts run
 // inside apps/server, and storage must not move when you start the app differently.
@@ -188,6 +252,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       "RIBBHU_COST_MICROS_PER_1K_TOKENS must be a non-negative number.",
     );
   }
+  const modelPricing = parseModelPricing(env.RIBBHU_MODEL_PRICING);
+  const runTokenBudget = parseNonNegativeInt(
+    env.RIBBHU_RUN_TOKEN_BUDGET,
+    "RIBBHU_RUN_TOKEN_BUDGET",
+    200_000,
+  );
+  const runCostMicros = parseNonNegativeInt(
+    env.RIBBHU_RUN_COST_MICROS,
+    "RIBBHU_RUN_COST_MICROS",
+    0,
+  );
+  const migrateOnly = env.RIBBHU_MIGRATE_ONLY?.trim() === "1";
 
   const sandboxRaw = env.RIBBHU_SANDBOX?.trim().toLowerCase() || "local";
   if (sandboxRaw !== "local" && sandboxRaw !== "docker") {
@@ -222,7 +298,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const strictRls = env.RIBBHU_STRICT_RLS?.trim() === "1";
   const allowUnsafeHosted = env.RIBBHU_ALLOW_UNSAFE_HOSTED?.trim() === "1";
   const hosted = !loopback || storageRaw === "postgres";
-  if (hosted && !allowUnsafeHosted) {
+  // Migration mode never serves traffic: the schema-admin posture rules (which
+  // describe the app credential) do not apply to a DDL-only run.
+  if (hosted && !allowUnsafeHosted && !migrateOnly) {
     const missing: string[] = [];
     if (sandboxRaw !== "docker") missing.push("RIBBHU_SANDBOX=docker");
     if (approvalsRaw === "allow") {
@@ -298,6 +376,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(anthropicApiKey ? { anthropicApiKey } : {}),
     ...(adminToken ? { adminToken } : {}),
     ...(costMicrosPer1kTokens > 0 ? { costMicrosPer1kTokens } : {}),
+    ...(modelPricing ? { modelPricing } : {}),
+    runTokenBudget,
+    runCostMicros,
+    migrateOnly,
   };
 }
 
@@ -323,7 +405,15 @@ export function describeConfig(config: Config): string {
     `  posture   ${config.allowUnsafeHosted ? "break-glass (RIBBHU_ALLOW_UNSAFE_HOSTED=1)" : "hardened"}${config.strictRls ? " · strict RLS" : ""}`,
     `  push      ${config.vapidPublicKey ? "Web Push enabled" : "disabled (set RIBBHU_VAPID_*)"}`,
     `  admin     ${config.adminToken ? "enabled at /admin" : "disabled (set RIBBHU_ADMIN_TOKEN)"}`,
-    `  pricing   ${config.costMicrosPer1kTokens ? `${config.costMicrosPer1kTokens} micros / 1k tokens` : "unset (usage cost recorded as 0)"}`,
+    `  pricing   ${
+      config.modelPricing
+        ? `${Object.keys(config.modelPricing).length} per-model rates`
+        : config.costMicrosPer1kTokens
+          ? `${config.costMicrosPer1kTokens} micros / 1k tokens`
+          : "unset (usage cost recorded as 0)"
+    }`,
+    `  budget    ${config.runTokenBudget} tokens/run${config.runCostMicros ? `, ${config.runCostMicros} micros/run cap` : ", no cost cap"}`,
+    `  migrate   ${config.migrateOnly ? "migrate-only (schema admin)" : "verify-only (no DDL from app)"}`,
   ];
   return lines.join("\n");
 }

@@ -206,6 +206,50 @@ CREATE INDEX IF NOT EXISTS jobs_active_conversation
   ON jobs(conversation_id) WHERE status IN ('pending','running');
 `;
 
+const QUOTA_RESERVATIONS = `
+CREATE TABLE IF NOT EXISTS quota_state (
+  tenant_id TEXT PRIMARY KEY,
+  day TEXT NOT NULL,
+  month TEXT NOT NULL,
+  day_tokens BIGINT NOT NULL DEFAULT 0,
+  day_reserved_tokens BIGINT NOT NULL DEFAULT 0,
+  month_tokens BIGINT NOT NULL DEFAULT 0,
+  month_cost_micros BIGINT NOT NULL DEFAULT 0,
+  month_reserved_cost_micros BIGINT NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS quota_reservations (
+  id SERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  conversation_id INTEGER NOT NULL,
+  submission_id INTEGER,
+  tokens BIGINT NOT NULL DEFAULT 0,
+  cost_micros BIGINT NOT NULL DEFAULT 0,
+  day TEXT NOT NULL,
+  month TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS quota_reservations_submission
+  ON quota_reservations(tenant_id, submission_id);
+CREATE INDEX IF NOT EXISTS quota_reservations_status
+  ON quota_reservations(tenant_id, status);
+
+ALTER TABLE quota_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE quota_state FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON quota_state;
+CREATE POLICY tenant_isolation ON quota_state
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+ALTER TABLE quota_reservations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE quota_reservations FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON quota_reservations;
+CREATE POLICY tenant_isolation ON quota_reservations
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+`;
+
 const SAAS_CONTROL_PLANE = `
 CREATE TABLE IF NOT EXISTS usage_events (
   id SERIAL PRIMARY KEY,
@@ -253,4 +297,8 @@ export const MIGRATIONS: Migration[] = [
   { version: 5, name: "token-lifecycle", sql: TOKEN_LIFECYCLE },
   { version: 6, name: "saas-control-plane", sql: SAAS_CONTROL_PLANE },
   { version: 7, name: "queue-uniqueness", sql: QUEUE_UNIQUENESS },
+  { version: 8, name: "quota-reservations", sql: QUOTA_RESERVATIONS },
 ];
+
+/** Highest schema version this build understands. */
+export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

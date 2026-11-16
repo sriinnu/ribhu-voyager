@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { QuotaExceeded } from "@ribhu-voyager/engine";
 import {
+  LATEST_SCHEMA_VERSION,
   PostgresStorage,
   closeApiTokenPools,
   issueApiToken,
@@ -59,7 +61,7 @@ test(
       let connected = false;
       for (let attempt = 0; attempt < 240 && !connected; attempt += 1) {
         try {
-          await storage.init();
+          await storage.init({ migrate: true });
           connected = true;
         } catch {
           await sleep(250);
@@ -88,7 +90,7 @@ test(
       );
       assert.deepEqual(
         migrations.rows.map((row) => Number(row.version)),
-        [1, 2, 3, 4, 5, 6, 7],
+        [1, 2, 3, 4, 5, 6, 7, 8],
       );
       const search = await storage.searchConversations("migrated message");
       assert.equal(search.length, 1);
@@ -197,6 +199,193 @@ test(
       await storage.close().catch(() => undefined);
       try {
         execFileSync("docker", ["rm", "-f", NAME], { stdio: "ignore" });
+      } catch {
+        /* container already gone */
+      }
+    }
+  },
+);
+
+const DISCIPLINE_PORT = 55448;
+const DISCIPLINE_NAME = `ribhu-pg-discipline-${process.pid}`;
+const DISCIPLINE_URL = `postgres://postgres:ribhu@127.0.0.1:${DISCIPLINE_PORT}/ribhu`;
+
+test(
+  "under-migrated Postgres refuses startup until schema-admin migrations run",
+  { timeout: 120_000, skip: ready ? false : "docker/postgres image unavailable" },
+  async () => {
+    execFileSync("docker", [
+      "run",
+      "--rm",
+      "-d",
+      "--name",
+      DISCIPLINE_NAME,
+      "-e",
+      "POSTGRES_PASSWORD=ribhu",
+      "-e",
+      "POSTGRES_DB=ribhu",
+      "-p",
+      `${DISCIPLINE_PORT}:5432`,
+      IMAGE,
+    ]);
+    const storage = new PostgresStorage(DISCIPLINE_URL);
+    try {
+      let connected = false;
+      for (let attempt = 0; attempt < 240 && !connected; attempt += 1) {
+        try {
+          await storage.schemaVersion();
+          connected = true;
+        } catch {
+          await sleep(250);
+        }
+      }
+      assert.equal(connected, true);
+
+      // App startup never runs DDL: a fresh database must fail clearly.
+      await assert.rejects(
+        storage.init(),
+        (error: unknown) =>
+          error instanceof Error && /schema is behind/.test(error.message),
+        "init() verifies the schema and does not migrate it",
+      );
+      assert.equal(await storage.schemaVersion(), 0);
+
+      // The explicit schema-admin path applies pending DDL.
+      const version = await storage.migrateSchema();
+      assert.equal(version, LATEST_SCHEMA_VERSION);
+      await storage.init();
+      assert.equal(await storage.schemaVersion(), LATEST_SCHEMA_VERSION);
+
+      // Simulate a database that is behind this build.
+      await storage.pool.query(
+        "DELETE FROM schema_migrations WHERE version = $1",
+        [LATEST_SCHEMA_VERSION],
+      );
+      await assert.rejects(
+        storage.init(),
+        (error: unknown) =>
+          error instanceof Error && /schema is behind/.test(error.message),
+      );
+      assert.equal(await storage.migrateSchema(), LATEST_SCHEMA_VERSION);
+      await storage.init();
+    } finally {
+      await storage.close().catch(() => undefined);
+      try {
+        execFileSync("docker", ["rm", "-f", DISCIPLINE_NAME], { stdio: "ignore" });
+      } catch {
+        /* container already gone */
+      }
+    }
+  },
+);
+
+const RESERVATION_PORT = 55449;
+const RESERVATION_NAME = `ribhu-pg-reservations-${process.pid}`;
+const RESERVATION_URL = `postgres://postgres:ribhu@127.0.0.1:${RESERVATION_PORT}/ribhu`;
+
+test(
+  "Postgres quota reservations are atomic at the boundary",
+  { timeout: 120_000, skip: ready ? false : "docker/postgres image unavailable" },
+  async () => {
+    execFileSync("docker", [
+      "run",
+      "--rm",
+      "-d",
+      "--name",
+      RESERVATION_NAME,
+      "-e",
+      "POSTGRES_PASSWORD=ribhu",
+      "-e",
+      "POSTGRES_DB=ribhu",
+      "-p",
+      `${RESERVATION_PORT}:5432`,
+      IMAGE,
+    ]);
+    const first = new PostgresStorage(RESERVATION_URL);
+    const second = new PostgresStorage(RESERVATION_URL);
+    try {
+      let connected = false;
+      for (let attempt = 0; attempt < 240 && !connected; attempt += 1) {
+        try {
+          await first.init({ migrate: true });
+          connected = true;
+        } catch {
+          await sleep(250);
+        }
+      }
+      assert.equal(connected, true);
+      await second.init();
+      const root = await first.ensureRoot();
+      await first.setQuota({ dailyTokens: 100 });
+
+      // Two connections reserve 60 tokens each against a 100-token limit.
+      const outcomes = await Promise.allSettled([
+        first.reserveQuota({
+          conversationId: root,
+          submissionId: 101,
+          tokens: 60,
+          costMicros: 0,
+        }),
+        second.reserveQuota({
+          conversationId: root,
+          submissionId: 102,
+          tokens: 60,
+          costMicros: 0,
+        }),
+      ]);
+      const fulfilled = outcomes.filter((entry) => entry.status === "fulfilled");
+      const rejected = outcomes.filter((entry) => entry.status === "rejected");
+      assert.equal(fulfilled.length, 1, "exactly one reservation wins the boundary");
+      assert.equal(rejected.length, 1);
+      assert.ok(
+        (rejected[0] as PromiseRejectedResult).reason instanceof QuotaExceeded,
+      );
+      const reservationId = (fulfilled[0] as PromiseFulfilledResult<
+        { id: number } | undefined
+      >).value!.id;
+
+      // Failed work releases the reservation back to the pool.
+      await first.releaseQuota(reservationId);
+      const releasedReservation = await first.quotaReservationFor(
+        fulfilled[0].status === "fulfilled" &&
+          (fulfilled[0] as PromiseFulfilledResult<{ submissionId: number | null }>)
+            .value?.submissionId === 101
+          ? 101
+          : 102,
+      );
+      assert.equal(releasedReservation?.status, "released");
+      const released = await first.reserveQuota({
+        conversationId: root,
+        submissionId: 103,
+        tokens: 60,
+        costMicros: 0,
+      });
+      assert.ok(released, "released headroom can be reserved again");
+
+      // Actual usage is recorded; committing keeps it counted.
+      await first.tx(async () => {
+        await first.recordUsage({
+          conversationId: root,
+          provider: "demo",
+          model: "ribhu-demo",
+          inputTokens: 30,
+          outputTokens: 10,
+          costMicros: 5,
+        });
+      });
+      await first.commitQuota(released!.id);
+      const committed = (await first.quotaReservationFor(103))!;
+      assert.equal(committed.status, "committed");
+      await assert.rejects(
+        first.reserveQuota({ conversationId: root, tokens: 70, costMicros: 0 }),
+        (error: unknown) => error instanceof QuotaExceeded,
+        "committed usage (40) + another 70 crosses the 100-token limit",
+      );
+    } finally {
+      await first.close().catch(() => undefined);
+      await second.close().catch(() => undefined);
+      try {
+        execFileSync("docker", ["rm", "-f", RESERVATION_NAME], { stdio: "ignore" });
       } catch {
         /* container already gone */
       }

@@ -4,6 +4,26 @@ import type { PoolClient } from "pg";
 
 import { PostgresStorage } from "./storage.js";
 
+/**
+ * Tables cleared by `--force`. `api_tokens` is intentionally excluded:
+ * operator-issued tenant tokens are provisioning credentials, not journal
+ * data; revoke them with `npm run tokens:postgres -- revoke`.
+ */
+export const RESET_TRUNCATE_TABLES = [
+  "conversations",
+  "entries",
+  "docs",
+  "submissions",
+  "jobs",
+  "tool_tasks",
+  "settings",
+  "cancels",
+  "usage_events",
+  "audit_events",
+  "quota_state",
+  "quota_reservations",
+] as const;
+
 export type MigrationCounts = {
   conversations: number;
   entries: number;
@@ -24,7 +44,8 @@ export async function migrateSqliteToPostgres(
   options: { reset?: boolean } = {},
 ): Promise<MigrationCounts> {
   const storage = new PostgresStorage(connectionString);
-  await storage.init();
+  // This CLI is the schema-admin path: it may apply DDL migrations.
+  await storage.init({ migrate: true });
   const sqlite = new DatabaseSync(sqlitePath);
   let client: PoolClient | undefined;
   const counts: MigrationCounts = {
@@ -40,8 +61,11 @@ export async function migrateSqliteToPostgres(
     const db = client;
     await db.query("BEGIN");
     if (options.reset === true) {
+      // `api_tokens` is intentionally NOT truncated: operator-issued tenant
+      // tokens are provisioning credentials, not journal data. Revoke them with
+      // `npm run tokens:postgres -- revoke` instead.
       await db.query(
-        "TRUNCATE conversations, entries, docs, submissions, jobs, tool_tasks, settings, cancels RESTART IDENTITY CASCADE",
+        `TRUNCATE ${RESET_TRUNCATE_TABLES.join(", ")} RESTART IDENTITY CASCADE`,
       );
     }
 
