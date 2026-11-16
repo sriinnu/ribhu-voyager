@@ -1603,6 +1603,48 @@ export class Db implements Storage {
     return [DEFAULT_TENANT];
   }
 
+  /** Applied local schema version (meta.schema); 0 when unknown. */
+  schemaVersion(): number {
+    const row = this.db
+      .prepare("SELECT value FROM meta WHERE key = 'schema'")
+      .get() as { value: string } | undefined;
+    const parsed = Number(row?.value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  /**
+   * Retention: delete local usage events older than `cutoff` (epoch ms).
+   * With `dryRun` only counts the rows. Never touches journal tables.
+   */
+  deleteOldUsage(cutoff: number, options: { dryRun?: boolean } = {}): number {
+    return this.deleteOlderThan("usage_events", cutoff, options);
+  }
+
+  /** Retention: delete local audit events older than `cutoff` (epoch ms). */
+  deleteOldAudit(cutoff: number, options: { dryRun?: boolean } = {}): number {
+    return this.deleteOlderThan("audit_events", cutoff, options);
+  }
+
+  private deleteOlderThan(
+    table: "usage_events" | "audit_events",
+    cutoff: number,
+    options: { dryRun?: boolean },
+  ): number {
+    if (!Number.isFinite(cutoff) || cutoff <= 0) {
+      throw new Error("retention cutoff must be a positive epoch-ms timestamp");
+    }
+    if (options.dryRun === true) {
+      const row = this.db
+        .prepare(`SELECT count(*) AS count FROM ${table} WHERE created_at < ?`)
+        .get(cutoff) as { count: number } | undefined;
+      return Number(row?.count ?? 0);
+    }
+    const info = this.db
+      .prepare(`DELETE FROM ${table} WHERE created_at < ?`)
+      .run(cutoff);
+    return Number(info.changes);
+  }
+
   requestCancel(conversationId: number): void {
     this.db
       .prepare(

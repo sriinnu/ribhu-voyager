@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { hashAdminToken } from "@ribhu-voyager/storage-postgres";
+
 import { createAdminApi, type AdminRequest } from "../src/admin.js";
 import { createApiRuntime } from "../src/api-runtime.js";
 import type { Config } from "../src/config.js";
@@ -207,8 +209,22 @@ test("admin usage/audit JSON and quota writes use the default SQLite tenant", { 
       monthlyCostMicros: 100_000,
     });
 
-    const quotaAudit = await api.storage.listAudit(10);
-    assert.ok(quotaAudit.some((event) => event.action === "quota.updated"));
+    // Admin reads are audited with the env-token actor, and quota writes use it too.
+    const tenantsRead = await admin.handle(
+      adminRequest({ headers: bearer("admin-token") }),
+    );
+    assert.equal(tenantsRead?.status, 200);
+    const adminAudit = await api.storage.listAudit(20);
+    for (const action of [
+      "admin.tenants_view",
+      "admin.usage_view",
+      "admin.audit_view",
+      "quota.updated",
+    ]) {
+      const event = adminAudit.find((entry) => entry.action === action);
+      assert.ok(event, `missing audit action ${action}`);
+      assert.equal(event.actor, "admin");
+    }
 
     // Validation and tenant scoping.
     assert.equal(
@@ -251,6 +267,100 @@ test("admin usage/audit JSON and quota writes use the default SQLite tenant", { 
     );
   } finally {
     await admin.close();
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+test("admin token hashes are stable SHA-256 and never the plaintext", () => {
+  const hash = hashAdminToken("ribhu_admin_secret-value");
+  assert.match(hash, /^[0-9a-f]{64}$/);
+  assert.notEqual(hash, "ribhu_admin_secret-value");
+  assert.equal(hashAdminToken("ribhu_admin_secret-value"), hash);
+  assert.notEqual(hashAdminToken("ribhu_admin_other"), hash);
+});
+
+test("retention deletes only old usage and audit rows", { timeout: 20_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ribhu-retention-"));
+  const api = await createApiRuntime(configFor(dir));
+  try {
+    const now = Date.now();
+    const old = now - 30 * 86_400_000;
+    await api.storage.recordUsage({
+      provider: "demo",
+      model: "ribhu-demo",
+      inputTokens: 10,
+      outputTokens: 0,
+      costMicros: 5,
+      createdAt: old,
+    });
+    await api.storage.recordUsage({
+      provider: "demo",
+      model: "ribhu-demo",
+      inputTokens: 20,
+      outputTokens: 0,
+      costMicros: 7,
+      createdAt: now,
+    });
+    await api.storage.recordAudit({
+      actor: "engine",
+      action: "old.event",
+      target: "x",
+      createdAt: old,
+    });
+    await api.storage.recordAudit({
+      actor: "engine",
+      action: "new.event",
+      target: "x",
+      createdAt: now,
+    });
+    const conversation = await api.conversation();
+    assert.ok(conversation);
+    await api.storage.appendEntry({
+      conversationId: conversation.id,
+      kind: "test.keep",
+      data: {},
+    });
+
+    // SQLite storage methods are sync behind the serialized async facade.
+    const retention = api.storage as unknown as {
+      deleteOldUsage(
+        cutoff: number,
+        options?: { dryRun?: boolean },
+      ): Promise<number>;
+      deleteOldAudit(
+        cutoff: number,
+        options?: { dryRun?: boolean },
+      ): Promise<number>;
+      schemaVersion(): Promise<number>;
+    };
+    const cutoff = now - 7 * 86_400_000;
+
+    assert.equal(await retention.deleteOldUsage(cutoff, { dryRun: true }), 1);
+    assert.equal(await retention.deleteOldAudit(cutoff, { dryRun: true }), 1);
+    assert.equal((await api.storage.listUsage(10)).length, 2);
+    assert.equal((await api.storage.listAudit(10)).length, 2);
+
+    assert.equal(await retention.deleteOldUsage(cutoff), 1);
+    assert.equal(await retention.deleteOldAudit(cutoff), 1);
+    assert.equal((await api.storage.listUsage(10)).length, 1);
+    assert.equal((await api.storage.listAudit(10)).length, 1);
+    assert.equal((await api.storage.listUsage(10))[0]?.inputTokens, 20);
+
+    // Journal entries and conversations are never touched by retention.
+    const entries = (await api.storage.entries(conversation.id)).entries;
+    assert.ok(entries.some((entry) => entry.kind === "test.keep"));
+    assert.equal(await api.storage.conversationExists(conversation.id), true);
+    assert.ok((await retention.schemaVersion()) >= 1);
+
+    await assert.rejects(
+      retention.deleteOldUsage(0),
+      /positive epoch-ms timestamp/,
+    );
+    await assert.rejects(
+      retention.deleteOldAudit(Number.NaN),
+      /positive epoch-ms timestamp/,
+    );
+  } finally {
     await api.close();
     await rm(dir, { recursive: true, force: true });
   }

@@ -39,7 +39,11 @@ export type Config = {
   vapidPublicKey?: string;
   vapidPrivateKey?: string;
   vapidSubject?: string;
-  /** Bearer token for the admin API/dashboard. Admin routes 404 when unset. */
+  /**
+   * Legacy deployment-wide admin bearer token. Postgres deployments can also
+   * authorize with DB `admin_tokens` rows (see `npm run admin-tokens`); when
+   * neither is available the admin/metrics routes 404.
+   */
   adminToken?: string;
   /** Usage pricing in micros per 1k tokens; 0/absent records zero cost. */
   costMicrosPer1kTokens?: number;
@@ -539,7 +543,13 @@ export function describeConfig(config: Config): string {
     }`,
     `  posture   ${config.allowUnsafeHosted ? "break-glass (RIBBHU_ALLOW_UNSAFE_HOSTED=1)" : "hardened"}${config.strictRls ? " · strict RLS" : ""}`,
     `  push      ${config.vapidPublicKey ? "Web Push enabled" : "disabled (set RIBBHU_VAPID_*)"}`,
-    `  admin     ${config.adminToken ? "enabled at /admin" : "disabled (set RIBBHU_ADMIN_TOKEN)"}`,
+    `  admin     ${
+      config.adminToken
+        ? "enabled at /admin (RIBBHU_ADMIN_TOKEN)"
+        : config.storage === "postgres"
+          ? "enabled at /admin (Postgres admin_tokens)"
+          : "disabled (set RIBBHU_ADMIN_TOKEN)"
+    }`,
     `  pricing   ${
       config.modelPricing
         ? `${Object.keys(config.modelPricing).length} per-model rates`

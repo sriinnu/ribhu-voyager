@@ -289,6 +289,19 @@ CREATE POLICY tenant_isolation ON audit_events
   WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 `;
 
+const ADMIN_TOKENS = `
+CREATE TABLE IF NOT EXISTS admin_tokens (
+  id SERIAL PRIMARY KEY,
+  label TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at BIGINT NOT NULL,
+  expires_at BIGINT,
+  revoked_at BIGINT,
+  last_used_at BIGINT
+);
+CREATE INDEX IF NOT EXISTS admin_tokens_hash ON admin_tokens(token_hash);
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: "init", sql: INIT },
   { version: 2, name: "postgres-fts", sql: SEARCH },
@@ -298,6 +311,7 @@ export const MIGRATIONS: Migration[] = [
   { version: 6, name: "saas-control-plane", sql: SAAS_CONTROL_PLANE },
   { version: 7, name: "queue-uniqueness", sql: QUEUE_UNIQUENESS },
   { version: 8, name: "quota-reservations", sql: QUOTA_RESERVATIONS },
+  { version: 9, name: "admin-tokens", sql: ADMIN_TOKENS },
 ];
 
 /** Highest schema version this build understands. */

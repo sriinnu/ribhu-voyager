@@ -1151,6 +1151,49 @@ export class PostgresStorage implements Storage {
     return result.rows.map(auditEvent);
   }
 
+  /**
+   * Retention: delete this tenant's usage events older than `cutoff` (epoch ms).
+   * With `dryRun` only counts the rows. RLS keeps this tenant-scoped.
+   */
+  async deleteOldUsage(
+    cutoff: number,
+    options: { dryRun?: boolean } = {},
+  ): Promise<number> {
+    return this.deleteOlderThan("usage_events", cutoff, options);
+  }
+
+  /** Retention: delete this tenant's audit events older than `cutoff` (epoch ms). */
+  async deleteOldAudit(
+    cutoff: number,
+    options: { dryRun?: boolean } = {},
+  ): Promise<number> {
+    return this.deleteOlderThan("audit_events", cutoff, options);
+  }
+
+  private async deleteOlderThan(
+    table: "usage_events" | "audit_events",
+    cutoff: number,
+    options: { dryRun?: boolean },
+  ): Promise<number> {
+    if (!Number.isFinite(cutoff) || cutoff <= 0) {
+      throw new Error("retention cutoff must be a positive epoch-ms timestamp");
+    }
+    if (options.dryRun === true) {
+      const result = await this.db().query(
+        `SELECT count(*)::int AS count FROM ${table} WHERE created_at < $1`,
+        [cutoff],
+      );
+      return n(result.rows[0]?.count);
+    }
+    const result = await this.db().query(
+      `WITH deleted AS (
+         DELETE FROM ${table} WHERE created_at < $1 RETURNING 1
+       ) SELECT count(*)::int AS count FROM deleted`,
+      [cutoff],
+    );
+    return n(result.rows[0]?.count);
+  }
+
   async quota(): Promise<Quota> {
     const [daily, monthly] = await Promise.all([
       this.getSetting(QUOTA_DAILY_TOKENS_KEY),

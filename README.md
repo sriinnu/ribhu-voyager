@@ -289,6 +289,11 @@ Demo commands:
 (`pending`/`running`), so you can tell the API is up while the worker is down or busy. Inputs are
 still admitted while the worker is down; the next worker claims the queued job.
 
+`/api/metrics` is the Prometheus view of the same deployment (queue depth, worker liveness,
+day/month token usage and cost, tenant runtime pool, schema version). It is protected by the admin
+token(s): `RIBBHU_ADMIN_TOKEN` and/or Postgres `admin_tokens`. See
+[docs/SAAS-CONTROL-PLANE.md](docs/SAAS-CONTROL-PLANE.md).
+
 ### Conversations and context
 
 ![Conversations, forks, and compaction](docs/ribhu-conversations.png)
@@ -386,6 +391,21 @@ The Postgres role must be **NOSUPERUSER / NOBYPASSRLS**; a superuser bypasses RL
 tokens with `npm run tokens:postgres -- issue|list|revoke`. The shared `RIBBHU_TOKEN` is for the local
 SQLite gateway; it is ignored when a Postgres token checker is active.
 
+Admin identity and data retention are separate CLIs:
+
+```bash
+npm run admin-tokens -- issue --label ops --days 30   # deployment-global admin token, printed once
+npm run admin-tokens -- list                          # metadata only (never hashes)
+npm run admin-tokens -- revoke --id 3
+npm run retention:postgres -- --days 90               # dry-run counts for usage/audit rows
+npm run retention:postgres -- --days 90 --apply       # delete only old usage_events/audit_events
+npm run retention:postgres -- --days 90 --sqlite .ribhu-data/ribhu.sqlite --apply
+```
+
+Retention never touches journal entries or conversations. See
+[docs/SAAS-CONTROL-PLANE.md](docs/SAAS-CONTROL-PLANE.md) for admin tokens, `/api/metrics`, and the
+full route/CLI reference.
+
 The API and worker both select the adapter from config; the Docker suite proves API + gateway +
 worker + engine + journal on Postgres, including two workers competing for one job and a hard worker
 crash with lease resume. Postgres schema changes are versioned (`schema_migrations`), and search uses
@@ -418,7 +438,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 | `RIBBHU_VAPID_PUBLIC_KEY` | unset | Web Push VAPID public key |
 | `RIBBHU_VAPID_PRIVATE_KEY` | unset | Web Push VAPID private key |
 | `RIBBHU_VAPID_SUBJECT` | `mailto:hello@srinivas.dev` | VAPID subject |
-| `RIBBHU_ADMIN_TOKEN` | unset | Bearer token for `/admin` and `/api/admin/*`; unset disables them |
+| `RIBBHU_ADMIN_TOKEN` | unset | Legacy bearer token for `/admin`, `/api/admin/*`, `/api/metrics`; Postgres can use DB `admin_tokens` instead |
 | `RIBBHU_COST_MICROS_PER_1K_TOKENS` | `0` | Usage pricing for quota/dashboard cost reporting |
 | `RIBBHU_STORAGE` | `sqlite` | `sqlite` or `postgres` |
 | `RIBBHU_POSTGRES_URL` | unset | Postgres URL when storage is `postgres` |
@@ -432,7 +452,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 ## Tests and development
 
 ```bash
-npm test          # 150 tests
+npm test          # 153 tests
 npm run typecheck
 npm run build
 npm run dev
@@ -530,6 +550,7 @@ next step. See [docs/ARCHITECTURE-UPGRADE.md](docs/ARCHITECTURE-UPGRADE.md) and 
 - **Single SQLite writer.** One gateway/worker pair per data directory. Postgres supports multiple
   workers with leases and fences.
 - **Usage, quotas, and audit are minimal.** Usage events and audit rows are recorded and can be
-  capped/inspected from an optional admin token + dashboard; there is no billing, invoicing, or
-  per-user roles. See [docs/SAAS-CONTROL-PLANE.md](docs/SAAS-CONTROL-PLANE.md).
+  capped/inspected from admin tokens (env or Postgres DB tokens) plus the dashboard and Prometheus
+  `/api/metrics`; usage/audit rows can be pruned by age with `retention:postgres`. There is no
+  billing, invoicing, or per-user roles. See [docs/SAAS-CONTROL-PLANE.md](docs/SAAS-CONTROL-PLANE.md).
 - **HTTP is cleartext.** The token gates the agent, not the traffic. Use TLS beyond your own LAN.

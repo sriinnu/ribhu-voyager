@@ -24,6 +24,8 @@
     "typecheck": "tsc -p packages/engine/tsconfig.json --noEmit && tsc -p packages/storage-postgres/tsconfig.json --noEmit && tsc -p apps/server/tsconfig.json --noEmit && tsc -p apps/mobile/tsconfig.json --noEmit",
     "migrate:postgres": "npm run migrate -w @ribhu-voyager/storage-postgres --",
     "tokens:postgres": "npm run tokens -w @ribhu-voyager/storage-postgres --",
+    "admin-tokens": "tsx packages/storage-postgres/src/admin-tokens-cli.ts",
+    "retention:postgres": "tsx packages/storage-postgres/src/retention-cli.ts",
     "provision:postgres": "npm run provision -w @ribhu-voyager/storage-postgres --",
     "ci": "npm run typecheck && npm run build && npm test"
   },

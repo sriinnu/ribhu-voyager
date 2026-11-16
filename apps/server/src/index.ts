@@ -142,7 +142,7 @@ const pool = createRuntimePool(
 
 // Admin control plane: usage/audit/quotas + the /admin dashboard. Every route
 // 404s when RIBBHU_ADMIN_TOKEN is unset.
-const admin = createAdminApi(config);
+const admin = createAdminApi(config, { poolStats: () => pool.stats() });
 
 const healthRateLimit = createRateLimiter({
   limit: config.rateLimitPerMinute ?? 120,
@@ -198,7 +198,11 @@ const server = createServer((request, response) => {
       return;
     }
 
-    if (url.pathname === "/admin" || url.pathname.startsWith("/api/admin")) {
+    if (
+      url.pathname === "/admin" ||
+      url.pathname === "/api/metrics" ||
+      url.pathname.startsWith("/api/admin")
+    ) {
       const adminResponse = await admin.handle({
         method: request.method ?? "GET",
         pathname: url.pathname,

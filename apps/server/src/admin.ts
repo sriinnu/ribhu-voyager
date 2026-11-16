@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import type {
   AuditEvent,
+  Awaitable,
   JsonObject,
   Quota,
   Storage,
@@ -10,15 +11,32 @@ import type {
   UsageSummary,
 } from "@ribhu-voyager/engine";
 import { Db, serializedStorage } from "@ribhu-voyager/storage-sqlite";
-import { PostgresStorage } from "@ribhu-voyager/storage-postgres";
+import {
+  PostgresStorage,
+  resolveAdminToken,
+} from "@ribhu-voyager/storage-postgres";
 
 import type { Config } from "./config.js";
+import { WORKER_STALE_MS } from "./health.js";
+import { type PoolStats } from "./runtime-pool.js";
 
 const DEFAULT_TENANT = "default";
 const DEFAULT_LIMIT = 50;
 const MAX_BODY_CHARS = 8_192;
 const ADMIN_PAGE = "/admin";
 const ADMIN_API = "/api/admin";
+const METRICS_PATH = "/api/metrics";
+
+/** Extra wiring the API process supplies for deployment-wide metrics. */
+export type AdminDeps = {
+  /** Current tenant runtime pool counters (capacity/active tenants). */
+  poolStats?: () => PoolStats;
+};
+
+export type AdminIdentity = {
+  /** Audit actor label: `admin` for the env token, `admin:<label>` for DB tokens. */
+  actor: string;
+};
 
 export type AdminRequest = {
   method: string;
@@ -35,9 +53,12 @@ export type AdminResponse = {
 };
 
 export type AdminApi = {
-  /** False when `RIBBHU_ADMIN_TOKEN` is unset; every admin route then 404s. */
+  /**
+   * False when neither `RIBBHU_ADMIN_TOKEN` nor Postgres admin tokens can
+   * authorize; every admin/metrics route then 404s.
+   */
   readonly enabled: boolean;
-  /** `undefined` when the request is not an admin route. */
+  /** `undefined` when the request is not an admin or metrics route. */
   handle(request: AdminRequest): Promise<AdminResponse | undefined>;
   close(): Promise<void>;
 };
@@ -50,6 +71,14 @@ function json(status: number, value: unknown): AdminResponse {
       "cache-control": "no-store",
     },
     body: JSON.stringify(value),
+  };
+}
+
+function text(body: string, contentType = "text/plain; charset=utf-8"): AdminResponse {
+  return {
+    status: 200,
+    headers: { "content-type": contentType, "cache-control": "no-store" },
+    body,
   };
 }
 
@@ -98,6 +127,21 @@ function parseLimit(query: URLSearchParams, fallback = DEFAULT_LIMIT): number {
   return Math.min(500, Math.trunc(parsed));
 }
 
+/** One Prometheus gauge: HELP/TYPE plus a sanitized numeric sample. */
+function metric(
+  name: string,
+  help: string,
+  raw: number,
+  type: "gauge" | "counter" = "gauge",
+): string[] {
+  const value = Number.isFinite(raw) ? Math.max(0, raw) : 0;
+  return [
+    `# HELP ribhu_${name} ${help}`,
+    `# TYPE ribhu_${name} ${type}`,
+    `ribhu_${name} ${value}`,
+  ];
+}
+
 /**
  * Admin control plane for usage, audit, quotas and tenants.
  *
@@ -107,11 +151,14 @@ function parseLimit(query: URLSearchParams, fallback = DEFAULT_LIMIT): number {
  * protects prompts also protects usage and audit rows. SQLite exposes its one
  * default tenant.
  */
-export function createAdminApi(config: Config): AdminApi {
+export function createAdminApi(config: Config, deps: AdminDeps = {}): AdminApi {
   const token = config.adminToken;
-  const enabled = typeof token === "string" && token !== "";
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
   const usesPostgres = config.storage === "postgres" && Boolean(config.postgresUrl);
+  // Postgres deployments can authorize with DB admin tokens even when the
+  // legacy RIBBHU_ADMIN_TOKEN env token is unset.
+  const enabled =
+    (typeof token === "string" && token !== "") || usesPostgres;
 
   let sqlite: Storage | undefined;
   const postgres = new Map<string, Promise<PostgresStorage>>();
@@ -160,9 +207,31 @@ export function createAdminApi(config: Config): AdminApi {
     return { tenant, storage: await storageFor(tenant) };
   };
 
-  const authorized = (request: AdminRequest): boolean => {
-    if (!enabled) return false;
-    return tokenMatches(token!, bearerToken(request.headers));
+  /** Env token (legacy) or a DB admin token; returns the audit actor. */
+  const authenticate = async (
+    request: AdminRequest,
+  ): Promise<AdminIdentity | undefined> => {
+    if (!enabled) return undefined;
+    const provided = bearerToken(request.headers);
+    if (provided === undefined || provided === "") return undefined;
+    if (
+      typeof token === "string" &&
+      token !== "" &&
+      tokenMatches(token, provided)
+    ) {
+      return { actor: "admin" };
+    }
+    if (!usesPostgres) return undefined;
+    try {
+      const row = await resolveAdminToken(config.postgresUrl!, provided);
+      return row ? { actor: `admin:${row.label}` } : undefined;
+    } catch (error) {
+      console.error(
+        "admin token lookup failed",
+        error instanceof Error ? error.message : String(error),
+      );
+      return undefined;
+    }
   };
 
   const usagePayload = async (
@@ -190,7 +259,10 @@ export function createAdminApi(config: Config): AdminApi {
     events: await storage.listAudit(limit),
   });
 
-  const handleQuota = async (request: AdminRequest): Promise<AdminResponse> => {
+  const handleQuota = async (
+    request: AdminRequest,
+    actor: string,
+  ): Promise<AdminResponse> => {
     let body: unknown;
     try {
       body = request.body ? JSON.parse(request.body) : undefined;
@@ -239,7 +311,7 @@ export function createAdminApi(config: Config): AdminApi {
     }
     await resolved.storage.setQuota(next);
     await resolved.storage.recordAudit({
-      actor: "admin",
+      actor,
       action: "quota.updated",
       target: resolved.tenant,
       data: next as JsonObject,
@@ -250,11 +322,134 @@ export function createAdminApi(config: Config): AdminApi {
     });
   };
 
+  const auditAdminRead = async (
+    storage: Storage,
+    actor: string,
+    action: "admin.usage_view" | "admin.audit_view" | "admin.tenants_view",
+    target: string,
+    data: JsonObject,
+  ): Promise<void> => {
+    try {
+      await storage.recordAudit({ actor, action, target, data });
+    } catch (error) {
+      // Auditing a read must not break the read itself.
+      console.error(
+        "admin audit write failed",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  };
+
+  const schemaVersionOf = async (storage: Storage): Promise<number> => {
+    const candidate = storage as Storage & {
+      schemaVersion?: () => Awaitable<number>;
+    };
+    if (typeof candidate.schemaVersion !== "function") return 0;
+    try {
+      return Number(await candidate.schemaVersion());
+    } catch {
+      return 0;
+    }
+  };
+
+  const metricsResponse = async (): Promise<AdminResponse> => {
+    const storage = await storageFor(defaultTenant);
+    const [queue, day, month, heartbeats] = await Promise.all([
+      storage.queueStats(),
+      storage.usageSummary("day"),
+      storage.usageSummary("month"),
+      storage.settingsMatching("worker_heartbeat:"),
+    ]);
+    const now = Date.now();
+    let workersTotal = 0;
+    let workersAlive = 0;
+    for (const pair of heartbeats) {
+      const heartbeat = Number(pair.value);
+      if (!Number.isFinite(heartbeat) || heartbeat <= 0) continue;
+      workersTotal += 1;
+      if (now - heartbeat < WORKER_STALE_MS) workersAlive += 1;
+    }
+    const pool: PoolStats =
+      deps.poolStats?.() ??
+      ({
+        activeTenants: 0,
+        pendingTenants: 0,
+        activeClients: 0,
+        idle: 0,
+        evictable: 0,
+        maxTenants: 0,
+        unlimited: true,
+        ttlMs: 0,
+        tenants: [],
+      } satisfies PoolStats);
+    const oldestPendingMs = queue.oldestPendingAgeMs ?? 0;
+    const lines = [
+      ...metric(
+        "queue_pending_jobs",
+        "Jobs waiting to be claimed by a worker.",
+        queue.pending,
+      ),
+      ...metric(
+        "queue_running_jobs",
+        "Jobs currently claimed by a worker.",
+        queue.running,
+      ),
+      ...metric(
+        "queue_oldest_pending_age_seconds",
+        "Age of the oldest pending job in seconds.",
+        oldestPendingMs / 1000,
+      ),
+      ...metric("workers_total", "Workers that have published a heartbeat.", workersTotal),
+      ...metric(
+        "workers_alive",
+        "Workers whose heartbeat is within the stale window.",
+        workersAlive,
+      ),
+      ...metric(
+        "usage_day_tokens",
+        "Model tokens recorded today (default tenant).",
+        day.totalTokens,
+      ),
+      ...metric(
+        "usage_month_tokens",
+        "Model tokens recorded this UTC month (default tenant).",
+        month.totalTokens,
+      ),
+      ...metric(
+        "usage_month_cost_micros",
+        "Model cost in micros recorded this UTC month (default tenant).",
+        month.costMicros,
+      ),
+      ...metric(
+        "tenant_runtimes_active",
+        "Tenant runtimes currently cached in this API process.",
+        pool.activeTenants,
+      ),
+      ...metric(
+        "tenant_runtimes_capacity",
+        "Configured maximum tenant runtimes (0 = unlimited).",
+        pool.maxTenants,
+      ),
+      ...metric(
+        "tenant_runtimes_unlimited",
+        "1 when the tenant runtime pool has no cap.",
+        pool.unlimited ? 1 : 0,
+      ),
+      ...metric(
+        "schema_version",
+        "Applied storage schema version.",
+        await schemaVersionOf(storage),
+      ),
+    ];
+    return text(`${lines.join("\n")}\n`, "text/plain; version=0.0.4; charset=utf-8");
+  };
+
   return {
     enabled,
     async handle(request: AdminRequest): Promise<AdminResponse | undefined> {
       const isAdminRoute =
         request.pathname === ADMIN_PAGE ||
+        request.pathname === METRICS_PATH ||
         request.pathname === ADMIN_API ||
         request.pathname.startsWith(`${ADMIN_API}/`);
       if (!isAdminRoute) return undefined;
@@ -272,7 +467,8 @@ export function createAdminApi(config: Config): AdminApi {
         };
       }
 
-      if (!authorized(request)) {
+      const identity = await authenticate(request);
+      if (identity === undefined) {
         return json(401, {
           error: "unauthorized",
           message: "A valid admin bearer token is required.",
@@ -280,39 +476,63 @@ export function createAdminApi(config: Config): AdminApi {
       }
 
       try {
+        if (request.pathname === METRICS_PATH) {
+          if (request.method !== "GET") return methodNotAllowed();
+          return await metricsResponse();
+        }
         if (request.pathname === `${ADMIN_API}/tenants`) {
           if (request.method !== "GET") return methodNotAllowed();
-          return json(200, { tenants: await tenants() });
+          const list = await tenants();
+          await auditAdminRead(
+            await storageFor(defaultTenant),
+            identity.actor,
+            "admin.tenants_view",
+            "deployment",
+            { tenants: list.length },
+          );
+          return json(200, { tenants: list });
         }
         if (request.pathname === `${ADMIN_API}/usage`) {
           if (request.method !== "GET") return methodNotAllowed();
+          const limit = parseLimit(request.query);
           const resolved = await resolveTenant(request.query.get("tenant"));
           if ("error" in resolved) return resolved.error;
-          return json(
-            200,
-            await usagePayload(
-              resolved.tenant,
-              resolved.storage,
-              parseLimit(request.query),
-            ),
+          const payload = await usagePayload(
+            resolved.tenant,
+            resolved.storage,
+            limit,
           );
+          await auditAdminRead(
+            resolved.storage,
+            identity.actor,
+            "admin.usage_view",
+            resolved.tenant,
+            { limit },
+          );
+          return json(200, payload);
         }
         if (request.pathname === `${ADMIN_API}/audit`) {
           if (request.method !== "GET") return methodNotAllowed();
+          const limit = parseLimit(request.query);
           const resolved = await resolveTenant(request.query.get("tenant"));
           if ("error" in resolved) return resolved.error;
-          return json(
-            200,
-            await auditPayload(
-              resolved.tenant,
-              resolved.storage,
-              parseLimit(request.query),
-            ),
+          const payload = await auditPayload(
+            resolved.tenant,
+            resolved.storage,
+            limit,
           );
+          await auditAdminRead(
+            resolved.storage,
+            identity.actor,
+            "admin.audit_view",
+            resolved.tenant,
+            { limit },
+          );
+          return json(200, payload);
         }
         if (request.pathname === `${ADMIN_API}/quota`) {
           if (request.method !== "POST") return methodNotAllowed();
-          return await handleQuota(request);
+          return await handleQuota(request, identity.actor);
         }
         return notFound();
       } catch (error) {
