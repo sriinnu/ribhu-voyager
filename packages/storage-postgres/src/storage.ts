@@ -595,12 +595,15 @@ export class PostgresStorage implements Storage {
   }
 
   async view(conversationId: number, limit = 100): Promise<ConversationView> {
-    const { entries: list } = await this.entries(conversationId, limit);
-    return {
-      conversation: { id: conversationId },
-      entries: list,
-      docs: await this.docs(conversationId),
-    };
+    // One transaction gives the client a consistent entries+docs snapshot.
+    return this.tx(async () => {
+      const { entries: list } = await this.entries(conversationId, limit);
+      return {
+        conversation: { id: conversationId },
+        entries: list,
+        docs: await this.docs(conversationId),
+      };
+    });
   }
 
   async appendEntry(
