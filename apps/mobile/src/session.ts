@@ -708,8 +708,7 @@ export class Session {
     const base = new URL(this.state.gateway);
     const path = base.pathname.replace(/\/+$/, "");
     const protocol = base.protocol === "https:" ? "wss:" : "ws:";
-    const query = this.token ? `?token=${encodeURIComponent(this.token)}` : "";
-    return `${protocol}//${base.host}${path}/ws${query}`;
+    return `${protocol}//${base.host}${path}/ws`;
   }
 
   private connect(): void {
@@ -727,7 +726,10 @@ export class Session {
 
     let socket: WebSocket;
     try {
-      socket = new WebSocket(this.url());
+      socket = new WebSocket(
+        this.url(),
+        this.token ? [`ribhu.token.${this.token}`] : undefined,
+      );
     } catch {
       this.scheduleReconnect();
       return;

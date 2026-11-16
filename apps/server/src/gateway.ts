@@ -67,6 +67,14 @@ function candidateToken(request: IncomingMessage, url: URL): string | undefined 
   if (typeof header === "string" && header.startsWith("Bearer ")) {
     return header.slice("Bearer ".length);
   }
+  const protocols = request.headers["sec-websocket-protocol"];
+  if (typeof protocols === "string") {
+    const tokenProtocol = protocols
+      .split(",")
+      .map((value) => value.trim())
+      .find((value) => value.startsWith("ribhu.token."));
+    if (tokenProtocol) return tokenProtocol.slice("ribhu.token.".length);
+  }
   return url.searchParams.get("token") ?? undefined;
 }
 
@@ -246,6 +254,12 @@ export function attachGateway(
   const wss = new WebSocketServer({
     noServer: true,
     maxPayload: 1_048_576,
+    handleProtocols: (protocols) => {
+      for (const protocol of protocols) {
+        if (protocol.startsWith("ribhu.token.")) return protocol;
+      }
+      return false;
+    },
   });
   const clients = new Set<Client>();
   const lives = new Map<string, Live>();

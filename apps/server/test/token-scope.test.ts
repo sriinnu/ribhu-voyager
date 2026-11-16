@@ -62,11 +62,30 @@ test("tenant API tokens are scoped at the WebSocket boundary", { timeout: 20_000
       ws.on("close", () => done(false, "closed"));
       setTimeout(() => done(false, "timeout"), 5_000);
     });
+  const connectProtocol = (token: string) =>
+    new Promise<boolean>((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, [
+        `ribhu.token.${token}`,
+      ]);
+      let settled = false;
+      const done = (open: boolean) => {
+        if (settled) return;
+        settled = true;
+        resolve(open);
+        ws.close();
+      };
+      ws.on("open", () => done(true));
+      ws.on("error", () => done(false));
+      ws.on("close", () => done(false));
+      setTimeout(() => done(false), 5_000);
+    });
   try {
     assert.equal((await connect("tenant-token")).open, true);
     assert.equal((await connect("other-tenant")).open, false);
     assert.equal((await connect("shared")).open, false);
     assert.equal((await connect("")).open, false);
+    assert.equal(await connectProtocol("tenant-token"), true);
+    assert.equal(await connectProtocol("other-tenant"), false);
   } finally {
     await gateway.close();
     await new Promise<void>((resolve) => server.close(() => resolve()));
