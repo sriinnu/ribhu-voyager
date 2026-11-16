@@ -40,6 +40,38 @@ const MISSING_BUILD = `<!doctype html>
 </main>
 </html>`;
 
+/**
+ * R8: response headers for the app shell. Scripts/styles are same-origin; the
+ * connect-src stays broad because the client can be configured to talk to a
+ * different gateway origin (self-hosted/tunnel), but frames and embedding are
+ * denied so the shell cannot be clickjacked.
+ */
+export const SECURITY_HEADERS: Readonly<Record<string, string>> = Object.freeze({
+  "content-security-policy": [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "connect-src 'self' http: https: ws: wss:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join("; "),
+  "x-frame-options": "DENY",
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "permissions-policy": "camera=(), microphone=(), geolocation=()",
+  "cross-origin-opener-policy": "same-origin",
+});
+
+function withSecurityHeaders(
+  headers: Record<string, string> = {},
+): Record<string, string> {
+  return { ...SECURITY_HEADERS, ...headers };
+}
+
 function cacheControl(path: string): string {
   if (path.startsWith("/assets/")) return "public, max-age=31536000, immutable";
   if (path === "/sw.js" || path === "/index.html" || path === "/") {
@@ -55,8 +87,13 @@ export type StaticHandler = (
 
 export function createStaticHandler(distDir: string): StaticHandler {
   return async (request, response) => {
+    const writeHead = (
+      status: number,
+      headers: Record<string, string> = {},
+    ) => response.writeHead(status, withSecurityHeaders(headers));
+
     if (request.method !== "GET" && request.method !== "HEAD") {
-      response.writeHead(405, { allow: "GET, HEAD" });
+      writeHead(405, { allow: "GET, HEAD" });
       response.end("Method not allowed");
       return true;
     }
@@ -66,7 +103,7 @@ export function createStaticHandler(distDir: string): StaticHandler {
     try {
       pathname = decodeURIComponent(url.pathname);
     } catch {
-      response.writeHead(400).end("Bad path");
+      writeHead(400).end("Bad path");
       return true;
     }
 
@@ -75,7 +112,7 @@ export function createStaticHandler(distDir: string): StaticHandler {
     const relative = normalize(pathname).replace(/^(\.\.[/\\])+/, "").replace(/^[/\\]+/, "");
     const absolute = join(distDir, relative);
     if (!absolute.startsWith(distDir + sep) && absolute !== distDir) {
-      response.writeHead(403).end("Forbidden");
+      writeHead(403).end("Forbidden");
       return true;
     }
 
@@ -88,7 +125,7 @@ export function createStaticHandler(distDir: string): StaticHandler {
       if (extname(pathname) === "") {
         file = join(distDir, "index.html");
       } else {
-        response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+        writeHead(404, { "content-type": "text/plain; charset=utf-8" });
         response.end("Not found");
         return true;
       }
@@ -98,7 +135,7 @@ export function createStaticHandler(distDir: string): StaticHandler {
     try {
       info = await stat(file);
     } catch {
-      response.writeHead(200, {
+      writeHead(200, {
         "content-type": "text/html; charset=utf-8",
         "cache-control": "no-cache",
       });
@@ -106,12 +143,10 @@ export function createStaticHandler(distDir: string): StaticHandler {
       return true;
     }
 
-    response.writeHead(200, {
+    writeHead(200, {
       "content-type": MIME[extname(file)] ?? "application/octet-stream",
       "content-length": String(info.size),
       "cache-control": cacheControl(pathname),
-      "x-content-type-options": "nosniff",
-      "referrer-policy": "no-referrer",
     });
 
     if (request.method === "HEAD") {

@@ -20,6 +20,7 @@
     "start:api": "npm run start:api -w @ribhu-voyager/server",
     "start:worker": "npm run start:worker -w @ribhu-voyager/server",
     "test": "node --import tsx --test --test-concurrency=1 apps/server/test/*.test.ts",
+    "secret:scan": "node scripts/secret-scan.mjs",
     "typecheck": "tsc -p packages/engine/tsconfig.json --noEmit && tsc -p packages/storage-postgres/tsconfig.json --noEmit && tsc -p apps/server/tsconfig.json --noEmit && tsc -p apps/mobile/tsconfig.json --noEmit",
     "migrate:postgres": "npm run migrate -w @ribhu-voyager/storage-postgres --",
     "tokens:postgres": "npm run tokens -w @ribhu-voyager/storage-postgres --",

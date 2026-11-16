@@ -262,18 +262,16 @@ export async function startWorker(
           }
         }, Math.floor(LEASE_MS / 3));
         renew.unref?.();
+        // Thread the claimed lease into engine writes: storage rejects any
+        // commit made after this worker loses the job/fence.
+        const guard = { jobId: job.id, owner, fence: job.fence };
+        const leaseValid = () => storage.jobOwned(job.id, owner, job.fence);
         try {
           if (job.kind === "compact") {
-            await engine.compact(job.conversation_id, undefined, () =>
-              storage.jobOwned(job.id, owner, job.fence),
-            );
+            await engine.compact(job.conversation_id, undefined, leaseValid, guard);
           } else {
-            await engine.recoverConversation(job.conversation_id, () =>
-              storage.jobOwned(job.id, owner, job.fence),
-            );
-            await engine.run(job.conversation_id, () =>
-              storage.jobOwned(job.id, owner, job.fence),
-            );
+            await engine.recoverConversation(job.conversation_id, leaseValid, guard);
+            await engine.run(job.conversation_id, leaseValid, guard);
           }
         } catch (error) {
           log(

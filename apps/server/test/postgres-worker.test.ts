@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { admitSubmission } from "@ribhu-voyager/engine";
+import { StaleFence, admitSubmission } from "@ribhu-voyager/engine";
 import { PostgresStorage } from "@ribhu-voyager/storage-postgres";
 
 import type { Config } from "../src/config.js";
@@ -114,6 +114,147 @@ test(
       await rm(dir, { recursive: true, force: true });
       try {
         execFileSync("docker", ["rm", "-f", NAME], { stdio: "ignore" });
+      } catch {
+        /* gone */
+      }
+    }
+  },
+);
+
+const HARDENING_PORT = 55447;
+const HARDENING_NAME = `ribhu-pg-hardening-${process.pid}`;
+const HARDENING_URL = `postgres://postgres:ribhu@127.0.0.1:${HARDENING_PORT}/ribhu`;
+
+test(
+  "Postgres queue uniqueness and fences reject a stale worker",
+  { timeout: 120_000, skip: ready ? false : "docker/postgres image unavailable" },
+  async () => {
+    execFileSync("docker", [
+      "run",
+      "--rm",
+      "-d",
+      "--name",
+      HARDENING_NAME,
+      "-e",
+      "POSTGRES_PASSWORD=ribhu",
+      "-e",
+      "POSTGRES_DB=ribhu",
+      "-p",
+      `${HARDENING_PORT}:5432`,
+      IMAGE,
+    ]);
+    const api = new PostgresStorage(HARDENING_URL);
+    const other = new PostgresStorage(HARDENING_URL);
+    try {
+      let connected = false;
+      for (let attempt = 0; attempt < 240 && !connected; attempt += 1) {
+        try {
+          await api.init();
+          connected = true;
+        } catch {
+          await sleep(250);
+        }
+      }
+      assert.equal(connected, true);
+      await other.init();
+      const root = await api.ensureRoot();
+
+      // R2: partial unique indexes exist and concurrent enqueues collapse.
+      const indexes = await api.pool.query(
+        "SELECT indexname FROM pg_indexes WHERE indexname IN ('jobs_active_run','jobs_active_compact') ORDER BY indexname",
+      );
+      assert.deepEqual(
+        indexes.rows.map((row) => String(row.indexname)),
+        ["jobs_active_compact", "jobs_active_run"],
+      );
+      await Promise.all([api.enqueueRun(root), other.enqueueRun(root)]);
+      const active = await api.pool.query(
+        "SELECT COUNT(*)::int AS n FROM jobs WHERE conversation_id = $1 AND kind = 'run' AND status IN ('pending','running')",
+        [root],
+      );
+      assert.equal(Number(active.rows[0]?.n), 1, "concurrent enqueues create one job");
+
+      // R2: concurrent claims are serialized by the per-conversation lock.
+      const [claimA, claimB] = await Promise.all([
+        api.claimRun("worker-a", 30_000),
+        other.claimRun("worker-b", 30_000),
+      ]);
+      const claimed = [claimA, claimB].filter((job) => job !== undefined);
+      assert.equal(claimed.length, 1, "only one worker claims the conversation");
+      const job = claimed[0]!;
+
+      // R3: expire the lease, let worker B reclaim, and reject A's guarded writes.
+      await api.renewRun(job.id, job.owner!, 1, job.fence);
+      await sleep(40);
+      const reclaimed = await other.claimRun("worker-b", 30_000);
+      assert.ok(reclaimed);
+      assert.equal(reclaimed.id, job.id);
+      assert.ok(reclaimed.fence > job.fence);
+
+      const guardA = { jobId: job.id, owner: job.owner!, fence: job.fence };
+      const guardB = {
+        jobId: reclaimed.id,
+        owner: "worker-b",
+        fence: reclaimed.fence,
+      };
+      await assert.rejects(
+        api.appendEntry(
+          {
+            conversationId: root,
+            kind: "pi.assistant",
+            model: [
+              {
+                role: "assistant",
+                content: [{ type: "text", text: "stale" }],
+                stopReason: "stop",
+                timestamp: Date.now(),
+                usage: { input: 0, output: 0, totalTokens: 0 },
+              },
+            ],
+          },
+          guardA,
+        ),
+        (error: unknown) => error instanceof StaleFence,
+      );
+      await assert.rejects(
+        api.createToolTask(root, "call_stale", "bash", {}, false, guardA),
+        (error: unknown) => error instanceof StaleFence,
+      );
+      const accepted = await other.appendEntry(
+        {
+          conversationId: root,
+          kind: "pi.assistant",
+          model: [
+            {
+              role: "assistant",
+              content: [{ type: "text", text: "fresh" }],
+              stopReason: "stop",
+              timestamp: Date.now(),
+              usage: { input: 0, output: 0, totalTokens: 0 },
+            },
+          ],
+        },
+        guardB,
+      );
+      assert.ok(accepted > 0);
+      const answers = await api.entries(root);
+      assert.equal(
+        answers.entries.filter((entry) => entry.kind === "pi.assistant").length,
+        1,
+        "exactly one answer is committed across the two workers",
+      );
+      const task = await other.createToolTask(root, "call_ok", "bash", {}, false, guardB);
+      await other.finishToolTask(task.id, "ok", "done", guardB);
+      await assert.rejects(
+        api.finishToolTask(task.id, "stale", "done", guardA),
+        (error: unknown) => error instanceof StaleFence,
+      );
+      await other.finishRun(reclaimed.id, "worker-b");
+    } finally {
+      await api.close().catch(() => undefined);
+      await other.close().catch(() => undefined);
+      try {
+        execFileSync("docker", ["rm", "-f", HARDENING_NAME], { stdio: "ignore" });
       } catch {
         /* gone */
       }

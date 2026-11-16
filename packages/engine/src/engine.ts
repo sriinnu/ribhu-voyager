@@ -2,7 +2,13 @@ import { admitSubmission } from "./admission.js";
 import { approvalArgsKey } from "./approval.js";
 import { seedConversation } from "./conversation.js";
 import { LeaseLost } from "./errors.js";
-import type { Awaitable, Storage, ToolRunner, ToolTaskRow } from "./ports.js";
+import type {
+  Awaitable,
+  Storage,
+  ToolRunner,
+  ToolTaskRow,
+  WriteGuard,
+} from "./ports.js";
 import type {
   ApprovalDecision,
   ApprovalsMode,
@@ -42,6 +48,8 @@ const APPROVAL_TOOLS = new Set(["bash", "write", "edit"]);
 const APPROVAL_POLL_MS = 300;
 /** An unanswered request is treated as denied after this long. */
 const APPROVAL_TIMEOUT_MS = 5 * 60_000;
+/** Soft cap for assembled model context; whole turns are dropped to reach it. */
+const CONTEXT_CHAR_BUDGET = 360_000;
 
 type ApprovalState = {
   status: "pending" | "approved" | "denied";
@@ -193,6 +201,11 @@ export class Engine {
   private readonly emitTimers = new Map<number, ReturnType<typeof setTimeout>>();
   private readonly lastEmit = new Map<number, number>();
   private readonly leaseLost = new Set<number>();
+  /**
+   * Active fence guard per conversation while this engine runs a claimed job.
+   * Embedded (no-lease) engines leave this empty and stay unguarded.
+   */
+  private readonly writeGuards = new Map<number, WriteGuard>();
   private readonly pendingEmits = new Set<Promise<void>>();
   private closed = false;
 
@@ -237,6 +250,17 @@ export class Engine {
     conversationId: number,
     signal?: AbortSignal,
     isLeaseValid?: () => Awaitable<boolean>,
+    guard?: WriteGuard,
+  ): Promise<number | undefined> {
+    return await this.adoptGuard(conversationId, guard, () =>
+      this.compactInner(conversationId, signal, isLeaseValid),
+    );
+  }
+
+  private async compactInner(
+    conversationId: number,
+    signal?: AbortSignal,
+    isLeaseValid?: () => Awaitable<boolean>,
   ): Promise<number | undefined> {
     const existing = this.aborts.get(conversationId);
     const controller = existing ?? new AbortController();
@@ -256,7 +280,16 @@ export class Engine {
       );
       const keep = Math.min(this.compactionKeepEntries, entries.length - 1);
       if (keep < 1) return undefined;
-      const cutoff = entries[entries.length - keep - 1];
+      const candidate = entries[entries.length - keep - 1];
+      if (!candidate) return undefined;
+      // A compaction boundary must be a turn boundary. Backing up to the last
+      // user entry guarantees the summary never ends inside an
+      // assistant/tool-call + tool-result pair.
+      let cutoff: EntryRecord | undefined;
+      for (const entry of entries) {
+        if (entry.id > candidate.id) break;
+        if (entry.kind === "pi.user") cutoff = entry;
+      }
       if (!cutoff) return undefined;
       const messages: ModelMessage[] = [];
       for (const entry of entries) {
@@ -287,7 +320,7 @@ export class Engine {
       if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
 
       const entryId = await this.storage.tx(async () =>
-        await this.storage.appendEntry({
+        await this.appendEntry({
           conversationId,
           kind: "pi.compaction",
           data: {
@@ -545,9 +578,12 @@ export class Engine {
         await this.recoverToolTask(task);
       }
     }
-    // Restart any conversation with open work.
+    // Restart any conversation with open work. A cancel that arrived while no
+    // worker was running is consumed here: the open submissions are settled
+    // aborted instead of being resumed.
     const ids = new Set(await this.storage.conversationIdsWithOpenWork());
     for (const id of ids) {
+      if (await this.consumeCancelledWork(id)) continue;
       if (this.autoRun) {
         void this.run(id).catch(() => undefined);
       } else {
@@ -556,7 +592,37 @@ export class Engine {
     }
   }
 
+  /**
+   * Settle open work whose conversation was stopped while the worker was down.
+   * Returns true when a stale cancel flag was consumed.
+   */
+  private async consumeCancelledWork(conversationId: number): Promise<boolean> {
+    if (!(await this.storage.isCancelRequested(conversationId))) return false;
+    const open = await this.storage.queuedSubmissions(conversationId);
+    await this.storage.settleSubmissionIds(
+      open.map((row) => row.id),
+      "aborted",
+    );
+    for (const task of await this.storage.runningToolTasks(conversationId)) {
+      await this.storage.finishToolTask(task.id, "Interrupted by user.", "aborted");
+    }
+    await this.storage.clearCancel(conversationId);
+    await this.emit(conversationId);
+    this.log(`consumed cancel conversation=${conversationId}`);
+    return true;
+  }
+
   async recoverConversation(
+    conversationId: number,
+    isLeaseValid?: () => Awaitable<boolean>,
+    guard?: WriteGuard,
+  ): Promise<void> {
+    return await this.adoptGuard(conversationId, guard, () =>
+      this.recoverConversationInner(conversationId, isLeaseValid),
+    );
+  }
+
+  private async recoverConversationInner(
     conversationId: number,
     isLeaseValid?: () => Awaitable<boolean>,
   ): Promise<void> {
@@ -593,7 +659,7 @@ export class Engine {
     isLeaseValid?: () => Awaitable<boolean>,
   ): Promise<void> {
     if (await this.storage.hasToolResult(task.conversation_id, task.call_id)) {
-      await this.storage.finishToolTask(task.id, "result already journaled", "done");
+      await this.storage.finishToolTask(task.id, "result already journaled", "done", this.guard(task.conversation_id));
       return;
     }
 
@@ -627,7 +693,7 @@ export class Engine {
       }
     } else if (!spec || spec.replaySafe === false) {
       await this.storage.tx(async () => {
-        await this.storage.appendEntry({
+        await this.appendEntry({
           conversationId: task.conversation_id,
           kind: "pi.tool-result",
           byTaskId: task.id,
@@ -643,7 +709,7 @@ export class Engine {
             },
           ],
         });
-        await this.storage.finishToolTask(task.id, "interrupted", "aborted");
+        await this.storage.finishToolTask(task.id, "interrupted", "aborted", this.guard(task.conversation_id));
       });
       await this.emit(task.conversation_id);
       return;
@@ -663,7 +729,7 @@ export class Engine {
         taskId: task.id,
       });
       await this.storage.tx(async () => {
-        await this.storage.appendEntry({
+        await this.appendEntry({
           conversationId: task.conversation_id,
           kind: "pi.tool-result",
           byTaskId: task.id,
@@ -678,13 +744,13 @@ export class Engine {
             },
           ],
         });
-        await this.storage.finishToolTask(task.id, result.content, result.isError ? "failed" : "done");
+        await this.storage.finishToolTask(task.id, result.content, result.isError ? "failed" : "done", this.guard(task.conversation_id));
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const aborted = executionSignal.aborted;
       await this.storage.tx(async () => {
-        await this.storage.appendEntry({
+        await this.appendEntry({
           conversationId: task.conversation_id,
           kind: "pi.tool-result",
           byTaskId: task.id,
@@ -705,6 +771,7 @@ export class Engine {
           task.id,
           message,
           aborted ? "aborted" : "failed",
+          this.guard(task.conversation_id),
         );
       });
       if (aborted) throw abortError();
@@ -715,20 +782,27 @@ export class Engine {
   async run(
     conversationId: number,
     isLeaseValid?: () => Awaitable<boolean>,
+    guard?: WriteGuard,
+  ): Promise<void> {
+    return await this.adoptGuard(conversationId, guard, () =>
+      this.runInner(conversationId, isLeaseValid),
+    );
+  }
+
+  private async runInner(
+    conversationId: number,
+    isLeaseValid?: () => Awaitable<boolean>,
   ): Promise<void> {
     if (this.closed || this.running.has(conversationId)) return;
     if (!await this.storage.conversationExists(conversationId)) return;
 
     const initial = await this.storage.queuedSubmissions(conversationId);
     const pendingAtStart = await this.pendingToolCalls(conversationId);
-    if (initial.length === 0 && pendingAtStart.length === 0) {
-      await this.storage.clearCancel(conversationId);
-      return;
-    }
+    if (initial.length === 0 && pendingAtStart.length === 0) return;
 
     this.running.add(conversationId);
-    // A cancel flag from an idle Stop must not poison this run.
-    await this.storage.clearCancel(conversationId);
+    // Stale cancel flags are cleared at admission; a flag set after the
+    // submission was admitted must still stop this run.
     const controller = new AbortController();
     this.aborts.set(conversationId, controller);
     const cancelTimer = setInterval(() => {
@@ -753,12 +827,11 @@ export class Engine {
           continue;
         }
         if (inputIds.includes(submission.id)) continue;
-        await this.storage.updateSubmission(submission.id, "running");
+        await this.storage.updateSubmission(submission.id, "running", {}, this.guard(conversationId));
         inputIds.push(submission.id);
       }
     };
     this.log(`run conversation=${conversationId} inputs=${inputIds.join(",")}`);
-    for (const id of inputIds) await this.storage.updateSubmission(id, "running");
     const live: LiveState = { run: { inputs: inputIds, turns: 0 } };
     this.live.set(conversationId, live);
     let failed: string | undefined;
@@ -767,6 +840,16 @@ export class Engine {
     let compactedThisRun = false;
 
     try {
+      // Mark the inputs running inside the guarded section: a worker that lost
+      // its fence before this write is rejected like any other stale commit.
+      for (const id of inputIds) {
+        await this.storage.updateSubmission(
+          id,
+          "running",
+          {},
+          this.guard(conversationId),
+        );
+      }
       for (let turn = 0; turn < this.maxTurns; turn += 1) {
         if (controller.signal.aborted) break;
         if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
@@ -784,7 +867,12 @@ export class Engine {
           );
           if (chars > this.compactionThresholdChars) {
             try {
-              await this.compact(conversationId, controller.signal);
+              await this.compact(
+                conversationId,
+                controller.signal,
+                undefined,
+                this.guard(conversationId),
+              );
             } catch (error) {
               this.log(
                 `compaction failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -817,7 +905,7 @@ export class Engine {
           last.kind === "pi.assistant" &&
           !this.entryHasToolCalls(last)
         ) {
-          await this.storage.settleSubmissionIds(inputIds, "done", { answerEntryId: last.id });
+          await this.storage.settleSubmissionIds(inputIds, "done", { answerEntryId: last.id }, this.guard(conversationId));
           settled = true;
           break;
         }
@@ -845,7 +933,7 @@ export class Engine {
         if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
         let entryId = 0;
         await this.storage.tx(async () => {
-          entryId = await this.storage.appendEntry({
+          entryId = await this.appendEntry({
             conversationId,
             kind: "pi.assistant",
             model: [assistant],
@@ -867,6 +955,7 @@ export class Engine {
               call.name,
               call.arguments,
               spec.replaySafe,
+              this.guard(conversationId),
             );
           }
         });
@@ -888,9 +977,12 @@ export class Engine {
         }
 
         if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
-        await this.storage.settleSubmissionIds(inputIds, "done", {
-          answerEntryId: entryId,
-        });
+        await this.storage.settleSubmissionIds(
+          inputIds,
+          "done",
+          { answerEntryId: entryId },
+          this.guard(conversationId),
+        );
         settled = true;
         live.run = undefined;
         break;
@@ -898,7 +990,7 @@ export class Engine {
 
       if (!settled && !controller.signal.aborted && !lostLease) {
         const detail = `Stopped after ${this.maxTurns} model turns.`;
-        await this.storage.settleSubmissionIds(inputIds, "failed", { error: detail });
+        await this.storage.settleSubmissionIds(inputIds, "failed", { error: detail }, this.guard(conversationId));
         live.runFailure = { reason: "turn_limit", detail };
         live.run = undefined;
         live.generation = undefined;
@@ -914,9 +1006,9 @@ export class Engine {
         live.run = undefined;
         live.generation = undefined;
       } else if (controller.signal.aborted) {
-        await this.storage.settleSubmissionIds(inputIds, "aborted");
+        await this.storage.settleSubmissionIds(inputIds, "aborted", {}, this.guard(conversationId));
         for (const task of await this.storage.runningToolTasks(conversationId)) {
-          await this.storage.finishToolTask(task.id, "Interrupted by user.", "aborted");
+          await this.storage.finishToolTask(task.id, "Interrupted by user.", "aborted", this.guard(conversationId));
         }
       } else {
         const message = error instanceof Error ? error.message : String(error);
@@ -926,6 +1018,7 @@ export class Engine {
           open.map((row) => row.id),
           "failed",
           { error: message },
+          this.guard(conversationId),
         );
         live.runFailure = {
           reason: "model_error",
@@ -1004,34 +1097,88 @@ export class Engine {
     return calls;
   }
 
+  /**
+   * Assemble model context as whole turns: `user -> assistant(+toolCalls) ->
+   * toolResults`. Turns are dropped from the front to fit the budget, never
+   * split; tool results whose tool call is missing are dropped as orphans.
+   */
   private async contextMessages(
     conversationId: number,
     activeInputs?: Set<number>,
   ): Promise<ModelMessage[]> {
-    const { entries } = await this.storage.entries(conversationId, this.maxWindowEntries);
+    // Read a generous tail so a turn is never cut by the raw entry window; the
+    // turn/char budget below is what actually bounds the request.
+    const fetchLimit = Math.max(this.maxWindowEntries * 8, 800);
+    const { entries } = await this.storage.entries(conversationId, fetchLimit);
     const compaction = await this.storage.lastEntryOfKind(conversationId, "pi.compaction");
     const boundary = compaction?.data as { coversUpTo?: unknown } | undefined;
     const coversUpTo =
       typeof boundary?.coversUpTo === "number" ? boundary.coversUpTo : undefined;
-    const messages: ModelMessage[] = [];
+
+    type ContextTurn = {
+      submissionId?: number;
+      messages: ModelMessage[];
+      toolCallIds: Set<string>;
+    };
+    const turns: ContextTurn[] = [];
+    let current: ContextTurn | undefined;
+
     for (const entry of entries) {
       if (coversUpTo !== undefined && entry.id <= coversUpTo) continue;
       if (entry.kind === "pi.compaction") continue;
-      if (entry.kind === "pi.user" && activeInputs) {
+      if (entry.kind === "pi.user") {
         const data = entry.data as { submissionId?: unknown } | undefined;
-        const submissionId = data?.submissionId;
-        if (typeof submissionId === "number" && !activeInputs.has(submissionId)) {
+        const submissionId =
+          typeof data?.submissionId === "number" ? data.submissionId : undefined;
+        current = {
+          messages: [],
+          toolCallIds: new Set<string>(),
+          ...(submissionId !== undefined ? { submissionId } : {}),
+        };
+        turns.push(current);
+        if (entry.model) current.messages.push(...entry.model);
+        continue;
+      }
+      const turn = current;
+      if (!turn || !entry.model) continue;
+      for (const message of entry.model) {
+        if (message.role === "toolResult") {
+          // Orphaned result: its assistant tool call is not in this turn.
+          if (!turn.toolCallIds.has(message.toolCallId)) continue;
+          turn.messages.push(message);
           continue;
         }
+        if (message.role === "assistant") {
+          for (const block of message.content) {
+            if (block.type === "toolCall") turn.toolCallIds.add(block.id);
+          }
+        }
+        turn.messages.push(message);
       }
-      if (entry.model) messages.push(...entry.model);
     }
-    // Keep the request bounded: trim from the front until under ~360k chars.
-    let total = messages.reduce((sum, message) => sum + JSON.stringify(message).length, 0);
-    while (total > 360_000 && messages.length > 10) {
-      const removed = messages.shift();
-      total -= removed ? JSON.stringify(removed).length : 0;
+
+    const included = turns.filter(
+      (turn) =>
+        !activeInputs ||
+        turn.submissionId === undefined ||
+        activeInputs.has(turn.submissionId),
+    );
+
+    // Trim only whole turns from the front. The newest turn is always kept even
+    // when it alone exceeds the budget.
+    const charCount = (turn: ContextTurn): number =>
+      turn.messages.reduce(
+        (sum, message) => sum + JSON.stringify(message).length,
+        0,
+      );
+    let first = 0;
+    let total = included.reduce((sum, turn) => sum + charCount(turn), 0);
+    while (first < included.length - 1 && total > CONTEXT_CHAR_BUDGET) {
+      total -= charCount(included[first]!);
+      first += 1;
     }
+    const messages: ModelMessage[] = [];
+    for (const turn of included.slice(first)) messages.push(...turn.messages);
     return messages;
   }
 
@@ -1243,7 +1390,7 @@ ${data.summary}`
         );
         if (rule) {
           await this.storage.tx(async () => {
-            await this.storage.appendEntry({
+            await this.appendEntry({
               conversationId,
               kind: "pi.approval",
               data: {
@@ -1273,7 +1420,7 @@ ${data.summary}`
         const now = Date.now();
         requestedAt = now;
         await this.storage.tx(async () => {
-          await this.storage.appendEntry({
+          await this.appendEntry({
             conversationId,
             kind: "pi.approval",
             data: {
@@ -1324,7 +1471,7 @@ ${data.summary}`
         requestedAt = requestedAt ?? latest.requestedAt ?? Date.now();
         if (Date.now() - requestedAt >= APPROVAL_TIMEOUT_MS) {
           await this.storage.tx(async () => {
-            await this.storage.appendEntry({
+            await this.appendEntry({
               conversationId,
               kind: "pi.approval",
               data: {
@@ -1366,7 +1513,7 @@ ${data.summary}`
         ? `Approval timed out after ${minutes} minutes for tool "${task.name}". The tool was not executed.`
         : `Approval denied for tool "${task.name}". The tool was not executed.`;
     await this.storage.tx(async () => {
-      await this.storage.appendEntry({
+      await this.appendEntry({
         conversationId: task.conversation_id,
         kind: "pi.tool-result",
         byTaskId: task.id,
@@ -1381,7 +1528,7 @@ ${data.summary}`
           },
         ],
       });
-      await this.storage.finishToolTask(task.id, content, "failed");
+      await this.storage.finishToolTask(task.id, content, "failed", this.guard(task.conversation_id));
     });
   }
 
@@ -1396,7 +1543,7 @@ ${data.summary}`
     const spec = this.runner.specs.find((entry) => entry.name === call.name);
     if (!spec) {
       await this.storage.tx(async () =>
-        await this.storage.appendEntry({
+        await this.appendEntry({
           conversationId,
           kind: "pi.tool-result",
           model: [
@@ -1420,7 +1567,7 @@ ${data.summary}`
     if (!task) {
       if (!spec.replaySafe) {
         await this.storage.tx(async () =>
-          await this.storage.appendEntry({
+          await this.appendEntry({
             conversationId,
             kind: "pi.tool-result",
             model: [
@@ -1446,12 +1593,13 @@ ${data.summary}`
           call.name,
           call.arguments,
           spec.replaySafe,
+          this.guard(conversationId),
         ),
       );
     }
     if (task.status !== "running") {
       await this.storage.tx(async () =>
-        await this.storage.appendEntry({
+        await this.appendEntry({
           conversationId,
           kind: "pi.tool-result",
           model: [
@@ -1504,7 +1652,7 @@ ${data.summary}`
       if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
       slot.status = "done";
       await this.storage.tx(async () => {
-        await this.storage.appendEntry({
+        await this.appendEntry({
           conversationId,
           kind: "pi.tool-result",
           byTaskId: task.id,
@@ -1523,6 +1671,7 @@ ${data.summary}`
           task.id,
           result.content.slice(0, 16_000),
           result.isError ? "failed" : "done",
+          this.guard(conversationId),
         );
       });
     } catch (error) {
@@ -1531,7 +1680,7 @@ ${data.summary}`
       if (isLeaseValid && !(await isLeaseValid())) throw new LeaseLost();
       slot.status = "done";
       await this.storage.tx(async () => {
-        await this.storage.appendEntry({
+        await this.appendEntry({
           conversationId,
           kind: "pi.tool-result",
           byTaskId: task.id,
@@ -1550,6 +1699,7 @@ ${data.summary}`
           task.id,
           message.slice(0, 16_000),
           aborted ? "aborted" : "failed",
+          this.guard(conversationId),
         );
       });
       if (aborted) throw new DOMException("Aborted", "AbortError");
@@ -1558,6 +1708,34 @@ ${data.summary}`
       (entry) => entry.callId !== call.id,
     );
     await this.emit(conversationId);
+  }
+
+  private guard(conversationId: number): WriteGuard | undefined {
+    return this.writeGuards.get(conversationId);
+  }
+
+  /** Journal append that carries the active fence guard, when there is one. */
+  private async appendEntry(
+    entry: Omit<EntryRecord, "id">,
+  ): Promise<number> {
+    return await this.storage.appendEntry(entry, this.guard(entry.conversationId));
+  }
+
+  /** Run `fn` with `guard` installed for this conversation (restores previous). */
+  private async adoptGuard<T>(
+    conversationId: number,
+    guard: WriteGuard | undefined,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    if (!guard) return await fn();
+    const previous = this.writeGuards.get(conversationId);
+    this.writeGuards.set(conversationId, guard);
+    try {
+      return await fn();
+    } finally {
+      if (previous) this.writeGuards.set(conversationId, previous);
+      else this.writeGuards.delete(conversationId);
+    }
   }
 
   private async addUsage(

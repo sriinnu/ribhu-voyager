@@ -24,7 +24,9 @@ import {
   type UsageEventInput,
   type UsagePeriod,
   type UsageSummary,
+  type WriteGuard,
 } from "@ribhu-voyager/engine";
+import { StaleFence } from "@ribhu-voyager/engine";
 
 import { MIGRATIONS } from "./migrations.js";
 
@@ -124,6 +126,18 @@ export class PostgresStorage implements Storage {
 
   private db(): Pool | PoolClient {
     return this.txContext.getStore() ?? this.pool;
+  }
+
+  /** Reject a fenced write once this worker no longer owns the job/fence. */
+  private async assertFence(guard?: WriteGuard): Promise<void> {
+    if (!guard) return;
+    const result = await this.db().query(
+      `SELECT 1 FROM jobs
+       WHERE id = $1 AND owner = $2 AND status = 'running'
+         AND lease_until > $3 AND fence = $4`,
+      [guard.jobId, guard.owner, now(), guard.fence],
+    );
+    if ((result.rowCount ?? 0) === 0) throw new StaleFence();
   }
 
   async tx<T>(fn: () => Awaitable<T>): Promise<T> {
@@ -458,20 +472,38 @@ export class PostgresStorage implements Storage {
     };
   }
 
-  async appendEntry(entryRow: Omit<EntryRecord, "id">): Promise<number> {
-    const result = await this.db().query(
+  async appendEntry(
+    entryRow: Omit<EntryRecord, "id">,
+    guard?: WriteGuard,
+  ): Promise<number> {
+    const timestamp = now();
+    const params: unknown[] = [
+      entryRow.conversationId,
+      entryRow.kind,
+      entryRow.model ? JSON.stringify(entryRow.model) : null,
+      entryRow.data ? JSON.stringify(entryRow.data) : null,
+      entryRow.byTaskId ?? null,
+      this.tenantId,
+      timestamp,
+    ];
+    let sql =
       `INSERT INTO entries(conversation_id, kind, model, data, by_task_id, tenant_id, created_at)
-       VALUES($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7) RETURNING id`,
-      [
-        entryRow.conversationId,
-        entryRow.kind,
-        entryRow.model ? JSON.stringify(entryRow.model) : null,
-        entryRow.data ? JSON.stringify(entryRow.data) : null,
-        entryRow.byTaskId ?? null,
-        this.tenantId,
-        now(),
-      ],
-    );
+       VALUES($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7) RETURNING id`;
+    if (guard) {
+      // Conditional INSERT: the row only lands while the fence still owns the
+      // job, so a stale worker cannot append to the journal.
+      sql =
+        `INSERT INTO entries(conversation_id, kind, model, data, by_task_id, tenant_id, created_at)
+         SELECT $1, $2, $3::jsonb, $4::jsonb, $5, $6, $7
+         WHERE EXISTS (
+           SELECT 1 FROM jobs
+           WHERE id = $8 AND owner = $9 AND status = 'running'
+             AND lease_until > $7 AND fence = $10
+         ) RETURNING id`;
+      params.push(guard.jobId, guard.owner, guard.fence);
+    }
+    const result = await this.db().query(sql, params);
+    if (guard && result.rows.length === 0) throw new StaleFence();
     await this.bump(this.db(), entryRow.conversationId);
     return n(result.rows[0].id);
   }
@@ -581,7 +613,9 @@ export class PostgresStorage implements Storage {
     id: number,
     status: SubmissionStatus,
     options: { answerEntryId?: number; error?: string } = {},
+    guard?: WriteGuard,
   ): Promise<void> {
+    await this.assertFence(guard);
     await this.db().query(
       `UPDATE submissions SET status = $1, answer_entry_id = $2, error = $3, updated_at = $4
        WHERE id = $5 AND status NOT IN ('done','failed','aborted')`,
@@ -593,8 +627,10 @@ export class PostgresStorage implements Storage {
     ids: number[],
     status: SubmissionStatus,
     options: { answerEntryId?: number; error?: string } = {},
+    guard?: WriteGuard,
   ): Promise<void> {
     if (ids.length === 0) return;
+    await this.assertFence(guard);
     await this.db().query(
       `UPDATE submissions SET status = $1,
          answer_entry_id = COALESCE($2, answer_entry_id), error = $3, updated_at = $4
@@ -628,11 +664,8 @@ export class PostgresStorage implements Storage {
   async enqueueRun(conversationId: number): Promise<void> {
     await this.db().query(
       `INSERT INTO jobs(conversation_id, kind, status, tenant_id, created_at, updated_at)
-       SELECT $1, 'run', 'pending', $2, $3, $3
-       WHERE NOT EXISTS (
-         SELECT 1 FROM jobs
-         WHERE conversation_id = $1 AND kind = 'run' AND status IN ('pending','running')
-       )`,
+       VALUES($1, 'run', 'pending', $2, $3, $3)
+       ON CONFLICT DO NOTHING`,
       [conversationId, this.tenantId, now()],
     );
   }
@@ -640,46 +673,64 @@ export class PostgresStorage implements Storage {
   async enqueueCompact(conversationId: number): Promise<void> {
     await this.db().query(
       `INSERT INTO jobs(conversation_id, kind, status, tenant_id, created_at, updated_at)
-       SELECT $1, 'compact', 'pending', $2, $3, $3
-       WHERE NOT EXISTS (
-         SELECT 1 FROM jobs
-         WHERE conversation_id = $1 AND kind = 'compact' AND status IN ('pending','running')
-       )`,
+       VALUES($1, 'compact', 'pending', $2, $3, $3)
+       ON CONFLICT DO NOTHING`,
       [conversationId, this.tenantId, now()],
     );
   }
 
   async claimRun(owner: string, leaseMs: number): Promise<QueueJob | undefined> {
-    const timestamp = now();
-    const leaseUntil = timestamp + leaseMs;
-    const result = await this.db().query(
-      `UPDATE jobs SET status = 'running', owner = $1, lease_until = $2,
-         fence = fence + 1, updated_at = $3
-       WHERE id = (
-         SELECT j.id FROM jobs j
-         WHERE (j.status = 'pending' OR (j.status = 'running' AND j.lease_until < $3))
+    // One claim transaction: pick a candidate, take a per-conversation advisory
+    // xact lock, then re-check and update. The lock serializes claims for one
+    // conversation across workers, so two workers can never claim two active
+    // jobs for the same conversation; the partial unique indexes are the
+    // durable backstop.
+    return await this.tx(async () => {
+      const timestamp = now();
+      const leaseUntil = timestamp + leaseMs;
+      const candidate = await this.db().query(
+        `SELECT j.id, j.conversation_id FROM jobs j
+         WHERE (j.status = 'pending' OR (j.status = 'running' AND j.lease_until < $1))
            AND NOT EXISTS (
              SELECT 1 FROM jobs other
              WHERE other.conversation_id = j.conversation_id
                AND other.status = 'running' AND other.id <> j.id
            )
-         ORDER BY j.id ASC FOR UPDATE SKIP LOCKED LIMIT 1
-       ) RETURNING *`,
-      [owner, leaseUntil, timestamp],
-    );
-    const row = result.rows[0];
-    if (!row) return undefined;
-    return {
-      id: n(row.id),
-      conversation_id: n(row.conversation_id),
-      kind: String(row.kind) as QueueJob["kind"],
-      status: "running",
-      fence: n(row.fence),
-      owner: String(row.owner),
-      lease_until: n(row.lease_until),
-      created_at: n(row.created_at),
-      updated_at: n(row.updated_at),
-    };
+         ORDER BY j.id ASC LIMIT 1`,
+        [timestamp],
+      );
+      const row = candidate.rows[0];
+      if (!row) return undefined;
+      await this.db().query("SELECT pg_advisory_xact_lock(727274, $1)", [
+        n(row.conversation_id),
+      ]);
+      const result = await this.db().query(
+        `UPDATE jobs AS j SET status = 'running', owner = $1, lease_until = $2,
+           fence = j.fence + 1, updated_at = $3
+         WHERE j.id = $4
+           AND (j.status = 'pending' OR (j.status = 'running' AND j.lease_until < $3))
+           AND NOT EXISTS (
+             SELECT 1 FROM jobs other
+             WHERE other.conversation_id = j.conversation_id
+               AND other.status = 'running' AND other.id <> j.id
+           )
+         RETURNING *`,
+        [owner, leaseUntil, timestamp, n(row.id)],
+      );
+      const claimed = result.rows[0];
+      if (!claimed) return undefined;
+      return {
+        id: n(claimed.id),
+        conversation_id: n(claimed.conversation_id),
+        kind: String(claimed.kind) as QueueJob["kind"],
+        status: "running",
+        fence: n(claimed.fence),
+        owner: String(claimed.owner),
+        lease_until: n(claimed.lease_until),
+        created_at: n(claimed.created_at),
+        updated_at: n(claimed.updated_at),
+      };
+    });
   }
 
   async renewRun(
@@ -739,13 +790,37 @@ export class PostgresStorage implements Storage {
     name: string,
     args: JsonObject,
     replaySafe: boolean,
+    guard?: WriteGuard,
   ): Promise<ToolTaskRow> {
-    const result = await this.db().query(
+    const timestamp = now();
+    const params: unknown[] = [
+      conversationId,
+      callId,
+      name,
+      JSON.stringify(args),
+      replaySafe,
+      this.tenantId,
+      timestamp,
+    ];
+    let sql =
       `INSERT INTO tool_tasks(
          conversation_id, call_id, name, args, replay_safe, status, tenant_id, created_at, updated_at
-       ) VALUES($1, $2, $3, $4::jsonb, $5, 'running', $6, $7, $7) RETURNING *`,
-      [conversationId, callId, name, JSON.stringify(args), replaySafe, this.tenantId, now()],
-    );
+       ) VALUES($1, $2, $3, $4::jsonb, $5, 'running', $6, $7, $7) RETURNING *`;
+    if (guard) {
+      sql =
+        `INSERT INTO tool_tasks(
+           conversation_id, call_id, name, args, replay_safe, status, tenant_id, created_at, updated_at
+         )
+         SELECT $1, $2, $3, $4::jsonb, $5, 'running', $6, $7, $7
+         WHERE EXISTS (
+           SELECT 1 FROM jobs
+           WHERE id = $8 AND owner = $9 AND status = 'running'
+             AND lease_until > $7 AND fence = $10
+         ) RETURNING *`;
+      params.push(guard.jobId, guard.owner, guard.fence);
+    }
+    const result = await this.db().query(sql, params);
+    if (guard && result.rows.length === 0) throw new StaleFence();
     return this.toolTask(result.rows[0]);
   }
 
@@ -780,10 +855,25 @@ export class PostgresStorage implements Storage {
     id: number,
     result: string,
     status: ToolTaskStatus,
+    guard?: WriteGuard,
   ): Promise<void> {
+    const timestamp = now();
+    if (guard) {
+      const updated = await this.db().query(
+        `UPDATE tool_tasks SET result = $1, status = $2, updated_at = $3
+         WHERE id = $4 AND EXISTS (
+           SELECT 1 FROM jobs
+           WHERE id = $5 AND owner = $6 AND status = 'running'
+             AND lease_until > $3 AND fence = $7
+         ) RETURNING id`,
+        [result, status, timestamp, id, guard.jobId, guard.owner, guard.fence],
+      );
+      if ((updated.rowCount ?? 0) === 0) throw new StaleFence();
+      return;
+    }
     await this.db().query(
       "UPDATE tool_tasks SET result = $1, status = $2, updated_at = $3 WHERE id = $4",
-      [result, status, now(), id],
+      [result, status, timestamp, id],
     );
   }
 

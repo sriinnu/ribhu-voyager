@@ -56,6 +56,13 @@ export async function admitSubmission(
         draft.requestId,
       );
       if (duplicate) return duplicate;
+      // A Stop requested while the conversation was idle (for example while
+      // the worker was down) must not poison this freshly admitted submission.
+      // Clear it here, at admission, instead of at run start where it could
+      // erase a Stop that raced the newly queued run.
+      if (!(await storage.busy(conversationId))) {
+        await storage.clearCancel(conversationId);
+      }
       const row = await storage.createSubmission(
         conversationId,
         draft.requestId,

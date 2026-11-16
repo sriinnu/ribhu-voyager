@@ -4,10 +4,10 @@ import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 
 import { PROTOCOL_VERSION } from "@ribhu-voyager/protocol";
-import type { IncomingMessage } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { describeConfig, loadConfig } from "./config.js";
-import { attachGateway } from "./gateway.js";
+import { attachGateway, createRateLimiter } from "./gateway.js";
 import {
   closeApiTokenPools,
   resolveApiToken,
@@ -86,6 +86,29 @@ const pool = createRuntimePool(
 // 404s when RIBBHU_ADMIN_TOKEN is unset.
 const admin = createAdminApi(config);
 
+const healthRateLimit = createRateLimiter({
+  limit: config.rateLimitPerMinute ?? 120,
+});
+
+function clientIp(request: IncomingMessage): string {
+  return request.socket.remoteAddress ?? "unknown";
+}
+
+function rateLimited(response: ServerResponse, retryAfterMs: number): void {
+  response.writeHead(429, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "retry-after": String(Math.max(1, Math.ceil(retryAfterMs / 1000))),
+  });
+  response.end(
+    JSON.stringify({
+      ok: false,
+      error: "rate_limited",
+      message: "Too many requests. Try again later.",
+    }),
+  );
+}
+
 const distDir = resolve(fileURLToPath(new URL("../../mobile/dist/", import.meta.url)));
 const serveStatic = createStaticHandler(distDir);
 
@@ -94,9 +117,20 @@ const server = createServer((request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
 
     if (url.pathname === "/api/health") {
+      const healthToken = requestToken(request, url);
+      for (const key of [
+        `ip:${clientIp(request)}`,
+        ...(healthToken ? [`token:${healthToken}`] : []),
+      ]) {
+        const limit = healthRateLimit?.take(key);
+        if (limit && !limit.allowed) {
+          rateLimited(response, limit.retryAfterMs);
+          return;
+        }
+      }
       // Authenticated callers get their tenant's detailed health; unknown or
       // missing tokens get only the minimal public payload.
-      const resolved = await pool.resolve(requestToken(request, url));
+      const resolved = await pool.resolve(healthToken);
       const payload = resolved
         ? await healthPayload(resolved.runtime, true)
         : {
@@ -143,19 +177,6 @@ const server = createServer((request, response) => {
   });
 });
 
-if (
-  !config.token &&
-  !hasTenantTokens &&
-  config.host !== "127.0.0.1" &&
-  config.host !== "::1" &&
-  config.host !== "localhost"
-) {
-  console.error(
-    `Refusing to bind ${config.host} without RIBBHU_TOKEN or a Postgres tenant token.`,
-  );
-  process.exit(1);
-}
-
 const gateway = attachGateway(
   server,
   undefined,
@@ -168,6 +189,9 @@ const gateway = attachGateway(
   {
     resolveRuntime: async (token) => (await pool.resolve(token))?.runtime,
     infoFor: (runtime) => pool.infoFor(runtime as ApiRuntime),
+    allowAnonymous: config.allowAnon === true,
+    allowedOrigins: config.allowedOrigins ?? [],
+    rateLimit: { limit: config.rateLimitPerMinute ?? 120, windowMs: 60_000 },
   },
 );
 
@@ -204,6 +228,11 @@ server.listen(config.port, config.host, () => {
 
   console.log(`\n${color.amber}${color.bold}Ribhu Voyager${color.reset}`);
   console.log(`${color.dim}${describeConfig(config)}${color.reset}\n`);
+  if (config.tokenGenerated) {
+    console.log(
+      `  ${color.amber}${color.bold}token${color.reset}     ${config.token}  ${color.dim}(generated this start — save it; the URL below carries it)${color.reset}`,
+    );
+  }
   console.log(`  ${color.green}gateway${color.reset}   ${local}${token}`);
   if (config.host === "0.0.0.0" || config.host === "::") {
     for (const address of lan) {

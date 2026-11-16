@@ -90,6 +90,9 @@ test(
             ...process.env,
             RIBBHU_STORAGE: "postgres",
             RIBBHU_POSTGRES_URL: URL,
+            // This fixture intentionally uses the local sandbox with the
+            // scripted demo provider; opt out of the hosted posture gate.
+            RIBBHU_ALLOW_UNSAFE_HOSTED: "1",
             RIBBHU_DATA_DIR: dir,
             RIBBHU_WORKSPACE: join(dir, "workspace"),
           },

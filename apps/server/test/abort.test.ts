@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +18,21 @@ import { startWorker } from "../src/worker.js";
 
 const usage: Usage = { input: 0, output: 0, totalTokens: 0 };
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor<T>(
+  probe: () => Promise<T | undefined>,
+  timeoutMs = 15_000,
+): Promise<T> {
+  const start = Date.now();
+  for (;;) {
+    const value = await probe();
+    if (value !== undefined) return value;
+    if (Date.now() - start >= timeoutMs) {
+      throw new Error("timed out waiting for the expected state");
+    }
+    await sleep(50);
+  }
+}
 
 class SlowProvider implements Provider {
   readonly id = "slow";
@@ -163,6 +179,82 @@ test("abort while idle does not cancel the next message", { timeout: 30_000 }, a
     );
   } finally {
     await worker.close();
+    await api.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stop sent while the worker is down aborts open work on restart", { timeout: 40_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ribhu-stop-down-"));
+  const config = configFor(dir);
+  const api = await createApiRuntime(config);
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    const conversation = await api.conversation();
+    assert.ok(conversation);
+
+    // A real worker process picks up a long-running bash tool, then dies hard.
+    child = spawn(
+      process.execPath,
+      ["--import", "tsx", "apps/server/src/worker-main.ts"],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          RIBBHU_DATA_DIR: dir,
+          RIBBHU_WORKSPACE: join(dir, "workspace"),
+          RIBBHU_PROVIDER: "demo",
+        },
+        stdio: "ignore",
+      },
+    );
+    await conversation.submit({
+      type: "input",
+      content: "run: sleep 5",
+      requestId: "down-stop-1",
+      whenBusy: "steer",
+    });
+    await waitFor(async () => {
+      const tasks = await api.storage.runningToolTasks(conversation.id);
+      return tasks.length > 0 ? true : undefined;
+    }, 20_000);
+    child.kill("SIGKILL");
+    await new Promise((resolve) => child!.once("exit", resolve));
+    assert.equal(
+      (await api.storage.findSubmission(conversation.id, "down-stop-1"))?.status,
+      "running",
+      "the submission is still open while the worker is down",
+    );
+
+    // Stop while the worker is down.
+    await conversation.abort();
+    assert.equal(await api.storage.isCancelRequested(conversation.id), true);
+
+    // Restarting consumes the cancel instead of resuming the open work.
+    const worker = await startWorker(config);
+    try {
+      await waitFor(async () => {
+        const row = await api.storage.findSubmission(conversation.id, "down-stop-1");
+        return row?.status === "aborted" ? true : undefined;
+      });
+      assert.equal(await api.storage.isCancelRequested(conversation.id), false);
+      assert.equal(
+        (await api.storage.runningToolTasks(conversation.id)).length,
+        0,
+        "the interrupted tool task is aborted, not re-run",
+      );
+      assert.equal(
+        (await api.storage.entries(conversation.id)).entries.filter(
+          (entry) => entry.kind === "pi.tool-result",
+        ).length,
+        0,
+        "no tool result is journaled for the stopped turn",
+      );
+    } finally {
+      await worker.close();
+    }
+  } finally {
+    child?.kill("SIGKILL");
     await api.close();
     await rm(dir, { recursive: true, force: true });
   }

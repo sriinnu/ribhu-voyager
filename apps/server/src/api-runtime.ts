@@ -25,6 +25,7 @@ import { PostgresStorage } from "@ribhu-voyager/storage-postgres";
 
 import type { AuthInfo, AuthMode } from "./auth.js";
 import type { Config } from "./config.js";
+import { pushHostAllowlist, validatePushEndpoint } from "./push.js";
 
 const VIEW_POLL_MS = 120;
 
@@ -75,9 +76,12 @@ export type GatewayRuntime = {
     subscription: PushSubscription | null,
     endpoint?: string,
   ): Promise<void>;
-  /** Register an APNs/FCM device token for this tenant/runtime. */
+  /**
+   * Register an APNs/FCM device token for this tenant/runtime, or unregister a
+   * platform's token(s) with `token: null`.
+   */
   setPushDevice?(
-    token: string,
+    token: string | null,
     platform: "ios" | "android",
   ): Promise<void>;
   authInfo?(): Awaitable<AuthInfo | undefined>;
@@ -335,11 +339,26 @@ export async function createApiRuntime(
     storage,
     ...(config.vapidPublicKey ? { pushPublicKey: config.vapidPublicKey } : {}),
     async setPushDevice(token, platform) {
-      if (
-        typeof token !== "string" ||
-        token.length < 16 ||
-        (platform !== "ios" && platform !== "android")
-      ) {
+      if (platform !== "ios" && platform !== "android") {
+        throw new Error("invalid device platform");
+      }
+      if (token === null) {
+        // Device-token unregister: clear every stored token for the platform.
+        const entries = await storage.settingsMatching("device:");
+        for (const entry of entries) {
+          if (entry.value === "") continue;
+          try {
+            const parsed = JSON.parse(entry.value) as { platform?: unknown };
+            if (parsed.platform === platform) {
+              await storage.setSetting(entry.key, "");
+            }
+          } catch {
+            /* unreadable entry; leave it */
+          }
+        }
+        return;
+      }
+      if (typeof token !== "string" || token.length < 16) {
         throw new Error("invalid device token");
       }
       const key = `device:${createHash("sha256").update(token).digest("hex")}`;
@@ -357,7 +376,6 @@ export async function createApiRuntime(
       }
       if (
         typeof subscription.endpoint !== "string" ||
-        !subscription.endpoint.startsWith("https://") ||
         typeof subscription.keys?.p256dh !== "string" ||
         subscription.keys.p256dh === "" ||
         typeof subscription.keys?.auth !== "string" ||
@@ -365,6 +383,11 @@ export async function createApiRuntime(
       ) {
         throw new Error("invalid push subscription");
       }
+      const problem = validatePushEndpoint(
+        subscription.endpoint,
+        pushHostAllowlist(config),
+      );
+      if (problem !== null) throw new Error(problem);
       await storage.setSetting(
         pushSettingKey(subscription.endpoint),
         JSON.stringify({ ...subscription, createdAt: Date.now() }),

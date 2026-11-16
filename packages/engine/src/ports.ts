@@ -79,6 +79,18 @@ export type SubmissionOptions = {
   error?: string;
 };
 
+/**
+ * Optional fence guard threaded into engine writes while a worker runs a
+ * claimed job. Storage rejects the write with `StaleFence` when the job row is
+ * no longer owned by this owner/fence (or its lease expired), so a worker that
+ * lost its lease cannot commit stale journal entries or tool results.
+ */
+export type WriteGuard = {
+  jobId: number;
+  owner: string;
+  fence: number;
+};
+
 export type Awaitable<T> = T | Promise<T>;
 
 /** One `settings` row exposed by `settingsMatching`. */
@@ -167,7 +179,7 @@ export interface SyncStorage {
   ): { entries: EntryRecord[]; before?: number };
   lastEntry(id: number): EntryRecord | undefined;
   lastEntryOfKind(id: number, kind: string): EntryRecord | undefined;
-  appendEntry(entry: Omit<EntryRecord, "id">): number;
+  appendEntry(entry: Omit<EntryRecord, "id">, guard?: WriteGuard): number;
   putDoc(id: number, kind: string, value: JsonObject): void;
   docs(id: number): Record<string, JsonObject>;
 
@@ -185,11 +197,14 @@ export interface SyncStorage {
     id: number,
     status: SubmissionStatus,
     options?: SubmissionOptions,
+    guard?: WriteGuard,
   ): void;
+  /** Settle many submissions; guarded settlement is rejected when stale. */
   settleSubmissionIds(
     ids: number[],
     status: SubmissionStatus,
     options?: SubmissionOptions,
+    guard?: WriteGuard,
   ): void;
   queuedSubmissions(conversationId: number): SubmissionRow[];
   busy(conversationId: number): boolean;
@@ -234,11 +249,14 @@ export interface SyncStorage {
     name: string,
     args: JsonObject,
     replaySafe: boolean,
+    guard?: WriteGuard,
   ): ToolTaskRow;
+  /** Finish a tool task; guarded finish is rejected when stale. */
   finishToolTask(
     id: number,
     result: string,
     status: ToolTaskStatus,
+    guard?: WriteGuard,
   ): void;
   runningToolTasks(conversationId?: number): ToolTaskRow[];
   hasToolResult(conversationId: number, callId: string): boolean;

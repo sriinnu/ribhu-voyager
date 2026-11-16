@@ -28,6 +28,9 @@ type Client = {
   runtime: GatewayRuntime;
   alive: boolean;
   conversationId?: number;
+  /** Rate-limit key material captured at upgrade time. */
+  ip?: string;
+  token?: string;
 };
 
 type Live = {
@@ -67,6 +70,123 @@ function candidateToken(request: IncomingMessage, url: URL): string | undefined 
 
 export type GatewayWindow = { min: number; max: number };
 
+export type RateLimitOptions = {
+  /** Requests allowed per key inside the window; 0 disables the limiter. */
+  limit: number;
+  windowMs?: number;
+};
+
+export type RateLimitResult = {
+  allowed: boolean;
+  retryAfterMs: number;
+};
+
+/**
+ * R8: small fixed-window limiter keyed by IP or token. Exported so the HTTP
+ * (health) path in index.ts uses the same budget semantics as the gateway.
+ */
+export class RateLimiter {
+  private readonly hits = new Map<string, { count: number; resetAt: number }>();
+  private readonly limit: number;
+  private readonly windowMs: number;
+
+  constructor(options: RateLimitOptions) {
+    this.limit = options.limit;
+    this.windowMs = options.windowMs ?? 60_000;
+  }
+
+  get disabled(): boolean {
+    return this.limit <= 0;
+  }
+
+  take(key: string, now = Date.now()): RateLimitResult {
+    if (this.disabled) return { allowed: true, retryAfterMs: 0 };
+    if (this.hits.size > 10_000) this.prune(now);
+    const entry = this.hits.get(key);
+    if (!entry || entry.resetAt <= now) {
+      this.hits.set(key, { count: 1, resetAt: now + this.windowMs });
+      return { allowed: true, retryAfterMs: 0 };
+    }
+    if (entry.count >= this.limit) {
+      return { allowed: false, retryAfterMs: Math.max(1, entry.resetAt - now) };
+    }
+    entry.count += 1;
+    return { allowed: true, retryAfterMs: 0 };
+  }
+
+  private prune(now: number): void {
+    for (const [key, entry] of this.hits) {
+      if (entry.resetAt <= now) this.hits.delete(key);
+    }
+  }
+}
+
+export function createRateLimiter(
+  options: RateLimitOptions | false | undefined,
+  fallback: RateLimitOptions = { limit: 120, windowMs: 60_000 },
+): RateLimiter | undefined {
+  if (options === false) return undefined;
+  const resolved = options ?? fallback;
+  return resolved.limit <= 0 ? undefined : new RateLimiter(resolved);
+}
+
+const LOOPBACK_ORIGIN_PROTOCOLS = new Set(["http:", "https:"]);
+
+/**
+ * R1: a browser WebSocket always sends Origin. Accept same-origin upgrades
+ * (Origin host === Host), plus explicit allowlist entries for native shells and
+ * tunnels. Missing Origin is allowed but still requires a token.
+ */
+export function originAllowed(
+  request: IncomingMessage,
+  allowedOrigins: readonly string[] = [],
+): boolean {
+  const raw = request.headers.origin;
+  if (typeof raw !== "string" || raw === "") return true; // non-browser client
+  if (allowedOrigins.includes(raw)) return true;
+  let origin: URL;
+  try {
+    origin = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (allowedOrigins.includes(origin.origin)) return true;
+  // Same-origin check: compare against the Host the client actually reached.
+  // Reverse proxies commonly rewrite Host; also accept their X-Forwarded-Host
+  // (a browser cannot forge it, and non-browser clients still need a token).
+  const forwarded = request.headers["x-forwarded-host"];
+  const forwardedHost =
+    typeof forwarded === "string" ? forwarded.split(",")[0]?.trim() : undefined;
+  const hosts = [request.headers.host, forwardedHost].filter(
+    (candidate): candidate is string =>
+      typeof candidate === "string" && candidate !== "",
+  );
+  if (
+    LOOPBACK_ORIGIN_PROTOCOLS.has(origin.protocol) &&
+    hosts.includes(origin.host)
+  ) {
+    return true;
+  }
+  const hostname = origin.hostname.toLowerCase();
+  return allowedOrigins.some((entry) => {
+    const normalized = entry.toLowerCase().replace(/\/+$/, "");
+    return normalized === hostname || normalized === origin.host;
+  });
+}
+
+function remoteKey(request: IncomingMessage): string {
+  return request.socket.remoteAddress ?? "unknown";
+}
+
+function writeUpgradeError(
+  socket: Duplex,
+  status: string,
+  headers: string,
+): void {
+  socket.write(`HTTP/1.1 ${status}\r\n${headers}Connection: close\r\n\r\n`);
+  socket.destroy();
+}
+
 export type GatewayOptions = {
   /** Legacy per-token check used by the default single-runtime resolver. */
   authorizeToken?: (candidate: string) => Promise<boolean>;
@@ -81,6 +201,15 @@ export type GatewayOptions = {
   ) => Promise<GatewayRuntime | undefined>;
   /** Wire identity for each runtime's `welcome`. Defaults to the positional info. */
   infoFor?: (runtime: GatewayRuntime) => ServerInfo;
+  /**
+   * R1: allow token-less upgrades when no token is configured. Defaults to
+   * `token === ""` for backward compatibility; production passes config.allowAnon.
+   */
+  allowAnonymous?: boolean;
+  /** R1: explicit allowed origins (native shells, tunnels) besides same-origin. */
+  allowedOrigins?: string[];
+  /** R8: per-IP upgrade + per-token submit rate limit; `false` disables. */
+  rateLimit?: RateLimitOptions | false;
 };
 
 export function attachGateway(
@@ -131,6 +260,10 @@ export function attachGateway(
       return defaultInfo;
     });
 
+  const allowAnonymous = options.allowAnonymous ?? token === "";
+  const rateLimiter = createRateLimiter(options.rateLimit);
+  const allowedOrigins = options.allowedOrigins ?? [];
+
   const defaultRuntime = runtime;
   const resolveRuntime =
     options.resolveRuntime ??
@@ -144,7 +277,10 @@ export function attachGateway(
           ? defaultRuntime
           : undefined;
       }
-      if (token === "") return defaultRuntime;
+      if (token === "") {
+        // No configured token: only an explicit anonymous opt-out may proceed.
+        return allowAnonymous ? defaultRuntime : undefined;
+      }
       if (candidate === undefined) return undefined;
       return safeEqual(candidate, token) ? defaultRuntime : undefined;
     });
@@ -415,7 +551,7 @@ export function attachGateway(
         }
         if (
           typeof message.token !== "string" ||
-          message.token.length < 16 ||
+          (message.token !== "" && message.token.length < 16) ||
           (message.platform !== "ios" && message.platform !== "android")
         ) {
           send(socket, {
@@ -426,7 +562,11 @@ export function attachGateway(
           return;
         }
         try {
-          await runtime.setPushDevice(message.token, message.platform);
+          // An empty token is the unregister signal for that platform.
+          await runtime.setPushDevice(
+            message.token === "" ? null : message.token,
+            message.platform,
+          );
         } catch (error) {
           send(socket, {
             t: "error",
@@ -620,6 +760,19 @@ export function attachGateway(
           return;
         }
 
+        const submitLimit = rateLimiter?.take(
+          `submit:${client.token ?? client.ip ?? "unknown"}`,
+        );
+        if (submitLimit && !submitLimit.allowed) {
+          send(socket, {
+            t: "error",
+            requestId: message.requestId,
+            code: "server_error",
+            message: `Rate limit exceeded — retry in ${Math.ceil(submitLimit.retryAfterMs / 1000)}s.`,
+          });
+          return;
+        }
+
         const conversation = await runtime.conversation(client.conversationId);
         if (!conversation) {
           send(socket, {
@@ -805,11 +958,17 @@ export function attachGateway(
     }
   };
 
-  const startClient = (socket: WebSocket, clientRuntime: GatewayRuntime) => {
+  const startClient = (
+    socket: WebSocket,
+    clientRuntime: GatewayRuntime,
+    meta: { ip?: string; token?: string } = {},
+  ) => {
     const client: Client = {
       socket,
       alive: true,
       runtime: clientRuntime,
+      ...(meta.ip ? { ip: meta.ip } : {}),
+      ...(meta.token ? { token: meta.token } : {}),
     };
     clients.add(client);
 
@@ -863,14 +1022,42 @@ export function attachGateway(
     }
     void (async () => {
       try {
-        const resolved = await resolveRuntime(candidateToken(request, url));
+        // R1: no drive-by browser control — reject cross-site origins first.
+        if (!originAllowed(request, allowedOrigins)) {
+          writeUpgradeError(socket, "403 Forbidden", "");
+          return;
+        }
+        // R8: per-IP upgrade budget (and per-token when one is presented).
+        const ip = remoteKey(request);
+        const ipLimit = rateLimiter?.take(`ip:${ip}`);
+        if (ipLimit && !ipLimit.allowed) {
+          writeUpgradeError(
+            socket,
+            "429 Too Many Requests",
+            `Retry-After: ${Math.ceil(ipLimit.retryAfterMs / 1000)}\r\n`,
+          );
+          return;
+        }
+        const candidate = candidateToken(request, url);
+        if (candidate) {
+          const tokenLimit = rateLimiter?.take(`token:${candidate}`);
+          if (tokenLimit && !tokenLimit.allowed) {
+            writeUpgradeError(
+              socket,
+              "429 Too Many Requests",
+              `Retry-After: ${Math.ceil(tokenLimit.retryAfterMs / 1000)}\r\n`,
+            );
+            return;
+          }
+        }
+        const resolved = await resolveRuntime(candidate);
         if (!resolved) {
           socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
           socket.destroy();
           return;
         }
         wss.handleUpgrade(request, socket, head, (ws) => {
-          startClient(ws, resolved);
+          startClient(ws, resolved, { ip, ...(candidate ? { token: candidate } : {}) });
         });
       } catch (error) {
         console.error("auth check failed", error);

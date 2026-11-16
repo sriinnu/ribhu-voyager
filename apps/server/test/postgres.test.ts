@@ -57,7 +57,7 @@ test(
     const storage = new PostgresStorage(URL);
     try {
       let connected = false;
-      for (let attempt = 0; attempt < 60 && !connected; attempt += 1) {
+      for (let attempt = 0; attempt < 240 && !connected; attempt += 1) {
         try {
           await storage.init();
           connected = true;
@@ -88,7 +88,7 @@ test(
       );
       assert.deepEqual(
         migrations.rows.map((row) => Number(row.version)),
-        [1, 2, 3, 4, 5, 6],
+        [1, 2, 3, 4, 5, 6, 7],
       );
       const search = await storage.searchConversations("migrated message");
       assert.equal(search.length, 1);

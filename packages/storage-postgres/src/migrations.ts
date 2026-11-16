@@ -190,6 +190,22 @@ ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires_at BIGINT;
 ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS id BIGSERIAL;
 `;
 
+const QUEUE_UNIQUENESS = `
+DELETE FROM jobs a USING jobs b
+ WHERE a.id < b.id
+   AND a.conversation_id = b.conversation_id
+   AND a.kind = b.kind
+   AND a.status IN ('pending','running')
+   AND b.status IN ('pending','running');
+
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_run
+  ON jobs(conversation_id) WHERE kind = 'run' AND status IN ('pending','running');
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_compact
+  ON jobs(conversation_id) WHERE kind = 'compact' AND status IN ('pending','running');
+CREATE INDEX IF NOT EXISTS jobs_active_conversation
+  ON jobs(conversation_id) WHERE status IN ('pending','running');
+`;
+
 const SAAS_CONTROL_PLANE = `
 CREATE TABLE IF NOT EXISTS usage_events (
   id SERIAL PRIMARY KEY,
@@ -236,4 +252,5 @@ export const MIGRATIONS: Migration[] = [
   { version: 4, name: "tenant-control-plane", sql: TENANT_CONTROL },
   { version: 5, name: "token-lifecycle", sql: TOKEN_LIFECYCLE },
   { version: 6, name: "saas-control-plane", sql: SAAS_CONTROL_PLANE },
+  { version: 7, name: "queue-uniqueness", sql: QUEUE_UNIQUENESS },
 ];

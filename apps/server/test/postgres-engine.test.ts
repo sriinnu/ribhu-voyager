@@ -50,7 +50,7 @@ test(
     const dir = await mkdtemp(join(tmpdir(), "ribhu-pg-engine-"));
     try {
       let connected = false;
-      for (let attempt = 0; attempt < 60 && !connected; attempt += 1) {
+      for (let attempt = 0; attempt < 240 && !connected; attempt += 1) {
         try {
           await storage.init();
           connected = true;

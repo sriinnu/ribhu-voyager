@@ -1,0 +1,74 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so newly disclosed dependency advisories and retroactive secret
+    # findings are caught even without a code change.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets:
+    name: Secret scan (history + tracked signing material)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so gitleaks can scan every commit, not just the tip.
+          fetch-depth: 0
+
+      - name: gitleaks (committed history)
+        # Pinned to the v3.0.0 commit rather than a moving tag; Dependabot's
+        # github-actions updates keep the pin current.
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Keep the workflow token read-only by not posting PR comments.
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # The repository is public: no keystores, provisioning profiles,
+      # push-service credential files, .secrets/ directory, or PEM private-key
+      # headers may be tracked. This reuses the local `npm run secret:scan`
+      # gate so contributors and CI enforce the same rule.
+      - name: Tracked signing material and private-key headers
+        run: npm run secret:scan
+
+  dependencies:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # Fail on high or critical advisories; low/moderate remain visible in
+      # Dependabot alerts without blocking every push.
+      - name: Audit (fail on high)
+        run: npm audit --audit-level=high

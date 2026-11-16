@@ -26,7 +26,9 @@ import {
   type UsageEventInput,
   type UsagePeriod,
   type UsageSummary,
+  type WriteGuard,
 } from "@ribhu-voyager/engine";
+import { StaleFence } from "@ribhu-voyager/engine";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -231,6 +233,7 @@ export class Db implements Storage {
     this.migrate();
     this.ensureConversationColumns();
     this.ensureJobColumns();
+    this.ensureJobUniqueness();
     this.ensureSearchIndex();
   }
 
@@ -298,6 +301,37 @@ export class Db implements Storage {
     }
     if (!columns.some((column) => column.name === "fence")) {
       this.db.exec("ALTER TABLE jobs ADD COLUMN fence INTEGER NOT NULL DEFAULT 0");
+    }
+  }
+
+  /**
+   * At most one active run and one active compact per conversation, even across
+   * the API/worker processes that share this SQLite file. Duplicate active jobs
+   * (possible only on old journals) are collapsed to the newest one first so
+   * the partial unique indexes can be created.
+   */
+  private ensureJobUniqueness(): void {
+    this.db.exec(
+      `DELETE FROM jobs
+       WHERE status IN ('pending','running')
+         AND id NOT IN (
+           SELECT MAX(id) FROM jobs
+           WHERE status IN ('pending','running')
+           GROUP BY conversation_id, kind
+         )`,
+    );
+    this.db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_run ON jobs(conversation_id) WHERE kind = 'run' AND status IN ('pending','running')",
+    );
+    this.db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_compact ON jobs(conversation_id) WHERE kind = 'compact' AND status IN ('pending','running')",
+    );
+  }
+
+  private assertFence(guard: WriteGuard | undefined): void {
+    if (!guard) return;
+    if (!this.jobOwned(guard.jobId, guard.owner, guard.fence)) {
+      throw new StaleFence();
     }
   }
 
@@ -636,20 +670,44 @@ export class Db implements Storage {
 
   appendEntry(
     entry: Omit<EntryRecord, "id">,
+    guard?: WriteGuard,
   ): number {
-    const info = this.db
-      .prepare(
-        `INSERT INTO entries(conversation_id, kind, model, data, by_task_id, created_at)
-         VALUES(?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        entry.conversationId,
-        entry.kind,
-        entry.model === undefined ? null : JSON.stringify(entry.model),
-        entry.data === undefined ? null : JSON.stringify(entry.data),
-        entry.byTaskId ?? null,
-        Date.now(),
-      );
+    const now = Date.now();
+    const values = [
+      entry.conversationId,
+      entry.kind,
+      entry.model === undefined ? null : JSON.stringify(entry.model),
+      entry.data === undefined ? null : JSON.stringify(entry.data),
+      entry.byTaskId ?? null,
+      now,
+    ] as const;
+    // One statement: the INSERT only happens while the guard's job row still
+    // matches the fence, so a stale worker cannot commit a journal entry.
+    const info = guard
+      ? this.db
+          .prepare(
+            `INSERT INTO entries(conversation_id, kind, model, data, by_task_id, created_at)
+             SELECT ?, ?, ?, ?, ?, ?
+             WHERE EXISTS (
+               SELECT 1 FROM jobs
+               WHERE id = ? AND owner = ? AND status = 'running'
+                 AND lease_until > ? AND fence = ?
+             )`,
+          )
+          .run(
+            ...values,
+            guard.jobId,
+            guard.owner,
+            now,
+            guard.fence,
+          )
+      : this.db
+          .prepare(
+            `INSERT INTO entries(conversation_id, kind, model, data, by_task_id, created_at)
+             VALUES(?, ?, ?, ?, ?, ?)`,
+          )
+          .run(...values);
+    if (guard && info.changes === 0) throw new StaleFence();
     const entryId = Number(info.lastInsertRowid);
     this.indexEntry(entryId, entry.conversationId, entry.model);
     this.bump(entry.conversationId);
@@ -819,7 +877,9 @@ export class Db implements Storage {
     id: number,
     status: SubmissionStatus,
     options: SubmissionOptions = {},
+    guard?: WriteGuard,
   ): void {
+    this.assertFence(guard);
     this.db
       .prepare(
         "UPDATE submissions SET status = ?, answer_entry_id = ?, error = ?, updated_at = ? WHERE id = ? AND status NOT IN ('done','failed','aborted')",
@@ -837,8 +897,10 @@ export class Db implements Storage {
     ids: number[],
     status: SubmissionStatus,
     options: SubmissionOptions = {},
+    guard?: WriteGuard,
   ): void {
     if (ids.length === 0) return;
+    this.assertFence(guard);
     const placeholders = ids.map(() => "?").join(",");
     this.db
       .prepare(
@@ -918,14 +980,37 @@ export class Db implements Storage {
     name: string,
     args: JsonObject,
     replaySafe: boolean,
+    guard?: WriteGuard,
   ): ToolTaskRow {
     const now = Date.now();
-    const info = this.db
-      .prepare(
-        `INSERT INTO tool_tasks(conversation_id, call_id, name, args, replay_safe, status, created_at, updated_at)
-         VALUES(?, ?, ?, ?, ?, 'running', ?, ?)`,
-      )
-      .run(conversationId, callId, name, JSON.stringify(args), replaySafe ? 1 : 0, now, now);
+    const values = [
+      conversationId,
+      callId,
+      name,
+      JSON.stringify(args),
+      replaySafe ? 1 : 0,
+      now,
+      now,
+    ] as const;
+    const info = guard
+      ? this.db
+          .prepare(
+            `INSERT INTO tool_tasks(conversation_id, call_id, name, args, replay_safe, status, created_at, updated_at)
+             SELECT ?, ?, ?, ?, ?, 'running', ?, ?
+             WHERE EXISTS (
+               SELECT 1 FROM jobs
+               WHERE id = ? AND owner = ? AND status = 'running'
+                 AND lease_until > ? AND fence = ?
+             )`,
+          )
+          .run(...values, guard.jobId, guard.owner, now, guard.fence)
+      : this.db
+          .prepare(
+            `INSERT INTO tool_tasks(conversation_id, call_id, name, args, replay_safe, status, created_at, updated_at)
+             VALUES(?, ?, ?, ?, ?, 'running', ?, ?)`,
+          )
+          .run(...values);
+    if (guard && info.changes === 0) throw new StaleFence();
     return this.toolTask(Number(info.lastInsertRowid))!;
   }
 
@@ -961,12 +1046,26 @@ export class Db implements Storage {
     id: number,
     result: string,
     status: ToolTaskStatus,
+    guard?: WriteGuard,
   ): void {
-    this.db
-      .prepare(
-        "UPDATE tool_tasks SET status = ?, result = ?, updated_at = ? WHERE id = ?",
-      )
-      .run(status, result, Date.now(), id);
+    const now = Date.now();
+    const info = guard
+      ? this.db
+          .prepare(
+            `UPDATE tool_tasks SET status = ?, result = ?, updated_at = ?
+             WHERE id = ? AND EXISTS (
+               SELECT 1 FROM jobs
+               WHERE id = ? AND owner = ? AND status = 'running'
+                 AND lease_until > ? AND fence = ?
+             )`,
+          )
+          .run(status, result, now, id, guard.jobId, guard.owner, now, guard.fence)
+      : this.db
+          .prepare(
+            "UPDATE tool_tasks SET status = ?, result = ?, updated_at = ? WHERE id = ?",
+          )
+          .run(status, result, now, id);
+    if (guard && info.changes === 0) throw new StaleFence();
   }
 
   hasToolResult(conversationId: number, callId: string): boolean {
@@ -986,7 +1085,7 @@ export class Db implements Storage {
     const now = Date.now();
     this.db
       .prepare(
-        `INSERT INTO jobs(conversation_id, kind, status, created_at, updated_at)
+        `INSERT OR IGNORE INTO jobs(conversation_id, kind, status, created_at, updated_at)
          SELECT ?, 'run', 'pending', ?, ?
          WHERE NOT EXISTS (
            SELECT 1 FROM jobs
@@ -1000,7 +1099,7 @@ export class Db implements Storage {
     const now = Date.now();
     this.db
       .prepare(
-        `INSERT INTO jobs(conversation_id, kind, status, created_at, updated_at)
+        `INSERT OR IGNORE INTO jobs(conversation_id, kind, status, created_at, updated_at)
          SELECT ?, 'compact', 'pending', ?, ?
          WHERE NOT EXISTS (
            SELECT 1 FROM jobs

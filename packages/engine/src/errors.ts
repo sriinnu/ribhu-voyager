@@ -19,6 +19,18 @@ export class LeaseLost extends Error {
   }
 }
 
+/**
+ * A fenced write was rejected because the worker no longer owns the job at that
+ * fence (lease expired or another worker reclaimed it).
+ */
+export class StaleFence extends LeaseLost {
+  constructor() {
+    super();
+    this.name = "StaleFence";
+    this.message = "The worker's lease fence is stale; the write was rejected.";
+  }
+}
+
 /** Admission refused because the tenant's daily token or monthly cost quota is spent. */
 export class QuotaExceeded extends Error {
   readonly code = "quota_exceeded";

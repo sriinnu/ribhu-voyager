@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -36,6 +37,23 @@ export type Config = {
   adminToken?: string;
   /** Usage pricing in micros per 1k tokens; 0/absent records zero cost. */
   costMicrosPer1kTokens?: number;
+  /**
+   * R1: allow a token-less runtime on loopback. Off by default; when off and no
+   * `RIBBHU_TOKEN` is configured, startup generates and prints one.
+   */
+  allowAnon?: boolean;
+  /** Explicit allowed browser origins for WS upgrades (native/tunnel use). */
+  allowedOrigins?: string[];
+  /** R8 break-glass: bypass the hosted posture refusal. Not for production. */
+  allowUnsafeHosted?: boolean;
+  /** R8: `RIBBHU_STRICT_RLS=1` must be on for hosted Postgres posture. */
+  strictRls?: boolean;
+  /** R8: per-IP/per-token request budget per minute; 0 disables. */
+  rateLimitPerMinute?: number;
+  /** R8: optional allowlist of push endpoint hosts (suffix match with `*.`). */
+  pushAllowedHosts?: string[];
+  /** True when startup generated a token instead of reading RIBBHU_TOKEN. */
+  tokenGenerated?: boolean;
 };
 
 // Resolve against the repository, not the caller's cwd: npm workspace scripts run
@@ -53,7 +71,41 @@ const REAL_PROVIDERS = new Set([
   "ollama",
 ]);
 
+/** Hosts that are only reachable from the same machine. */
+export function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return (
+    normalized === "127.0.0.1" ||
+    normalized === "::1" ||
+    normalized === "[::1]" ||
+    normalized === "localhost" ||
+    normalized === "::ffff:127.0.0.1"
+  );
+}
+
+function parseList(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
+}
+
+function parseRateLimit(env: NodeJS.ProcessEnv): number {
+  const raw = env.RIBBHU_RATE_LIMIT_PER_MINUTE?.trim();
+  if (raw === undefined || raw === "") return 120;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(
+      "RIBBHU_RATE_LIMIT_PER_MINUTE must be a non-negative integer (0 disables).",
+    );
+  }
+  return value;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const host = env.HOST?.trim() || "127.0.0.1";
+  const loopback = isLoopbackHost(host);
   const provider = env.RIBBHU_PROVIDER?.trim() || "demo";
   const model = env.RIBBHU_MODEL?.trim() || "";
   const demo = provider === "demo" || env.RIBBHU_DEMO === "1";
@@ -144,8 +196,71 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
+  // ---- R1: no unauthenticated default runtime ----
+  const allowAnon = env.RIBBHU_ALLOW_ANON?.trim() === "1";
+  const tenantTokenAuth = storageRaw === "postgres";
+  const configuredToken = env.RIBBHU_TOKEN?.trim() || "";
+  let token = configuredToken;
+  let tokenGenerated = false;
+  if (!loopback && allowAnon) {
+    throw new Error(
+      "RIBBHU_ALLOW_ANON=1 is only allowed on loopback; set RIBBHU_TOKEN or tenant tokens for non-loopback hosts.",
+    );
+  }
+  if (!loopback && token === "" && !tenantTokenAuth) {
+    throw new Error(
+      `RIBBHU_TOKEN is required when binding ${host}; non-loopback hosts always require a token.`,
+    );
+  }
+  if (token === "" && !allowAnon && !tenantTokenAuth) {
+    // Generated per start and printed by the server; the URL carries it.
+    token = randomBytes(24).toString("base64url");
+    tokenGenerated = true;
+  }
+
+  // ---- R8: hosted posture ----
+  const strictRls = env.RIBBHU_STRICT_RLS?.trim() === "1";
+  const allowUnsafeHosted = env.RIBBHU_ALLOW_UNSAFE_HOSTED?.trim() === "1";
+  const hosted = !loopback || storageRaw === "postgres";
+  if (hosted && !allowUnsafeHosted) {
+    const missing: string[] = [];
+    if (sandboxRaw !== "docker") missing.push("RIBBHU_SANDBOX=docker");
+    if (approvalsRaw === "allow") {
+      missing.push("RIBBHU_APPROVALS=ask (or deny-bash/read-only)");
+    }
+    if (storageRaw === "postgres" && !strictRls) {
+      missing.push("RIBBHU_STRICT_RLS=1");
+    }
+    if (missing.length > 0) {
+      throw new Error(
+        `Refusing unsafe hosted posture for ${host}${storageRaw === "postgres" ? " (Postgres)" : ""}: ` +
+          `set ${missing.join(", ")}. ` +
+          "Set RIBBHU_ALLOW_UNSAFE_HOSTED=1 only as an explicit, temporary break-glass.",
+      );
+    }
+  }
+
+  const allowedOrigins = parseList(env.RIBBHU_ALLOWED_ORIGINS);
+  for (const origin of allowedOrigins) {
+    if (origin === "*") continue;
+    try {
+      // Accept full origins (https://app.example.com) and bare hosts.
+      new URL(origin.includes("://") ? origin : `https://${origin}`);
+    } catch {
+      throw new Error(
+        `Unknown RIBBHU_ALLOWED_ORIGINS entry "${origin}". Use origins or hosts.`,
+      );
+    }
+  }
+
+  const pushAllowedHosts = parseList(env.RIBBHU_PUSH_ALLOWED_HOSTS).map((entry) =>
+    entry.toLowerCase(),
+  );
+
+  const rateLimitPerMinute = parseRateLimit(env);
+
   return {
-    host: env.HOST?.trim() || "127.0.0.1",
+    host,
     port: Number.parseInt(env.PORT ?? "8787", 10),
     dataDir: resolve(env.RIBBHU_DATA_DIR?.trim() || join(projectRoot, ".ribhu-data")),
     workspaceDir: resolve(env.RIBBHU_WORKSPACE?.trim() || join(projectRoot, ".ribhu-workspace")),
@@ -154,7 +269,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     demo,
     demoTokensPerSecond: Number.parseFloat(env.RIBBHU_DEMO_TPS ?? "38"),
     maxWindowEntries: Number.parseInt(env.RIBBHU_WINDOW_ENTRIES ?? "100", 10),
-    token: env.RIBBHU_TOKEN?.trim() || "",
+    token,
+    tokenGenerated,
+    allowAnon,
+    allowedOrigins,
+    allowUnsafeHosted,
+    strictRls,
+    rateLimitPerMinute,
+    pushAllowedHosts,
     authMode,
     authSource,
     storage: storageRaw,
@@ -187,6 +309,18 @@ export function describeConfig(config: Config): string {
     `  storage   ${config.storage === "postgres" ? `Postgres (tenant ${config.tenantId ?? "default"})` : join(config.dataDir, "ribhu.sqlite")}`,
     `  approvals ${config.approvals ?? "allow"}`,
     `  sandbox   ${config.sandbox ?? "local"}${config.sandbox === "docker" ? ` (${config.sandboxImage ?? "node:24-bookworm"})` : ""}`,
+    `  auth      ${
+      config.token !== ""
+        ? config.tokenGenerated
+          ? "token (generated this start)"
+          : "token (RIBBHU_TOKEN)"
+        : config.storage === "postgres"
+          ? "tenant tokens (Postgres api_tokens)"
+          : "anonymous loopback (RIBBHU_ALLOW_ANON=1)"
+    }`,
+    `  origins   ${config.allowedOrigins?.length ? config.allowedOrigins.join(", ") : "same-origin only"}`,
+    `  rate      ${config.rateLimitPerMinute ? `${config.rateLimitPerMinute}/min per IP or token` : "disabled"}`,
+    `  posture   ${config.allowUnsafeHosted ? "break-glass (RIBBHU_ALLOW_UNSAFE_HOSTED=1)" : "hardened"}${config.strictRls ? " · strict RLS" : ""}`,
     `  push      ${config.vapidPublicKey ? "Web Push enabled" : "disabled (set RIBBHU_VAPID_*)"}`,
     `  admin     ${config.adminToken ? "enabled at /admin" : "disabled (set RIBBHU_ADMIN_TOKEN)"}`,
     `  pricing   ${config.costMicrosPer1kTokens ? `${config.costMicrosPer1kTokens} micros / 1k tokens` : "unset (usage cost recorded as 0)"}`,
