@@ -541,7 +541,16 @@ export class PostgresStorage implements Storage {
        ) recent ORDER BY id ASC`,
       [conversationId, limit],
     );
-    return { entries: result.rows.map(entry) };
+    const entries = result.rows.map(entry);
+    if (entries.length === 0) return { entries };
+    const previous = await this.db().query(
+      "SELECT id FROM entries WHERE conversation_id = $1 AND id < $2 ORDER BY id DESC LIMIT 1",
+      [conversationId, entries[0]!.id],
+    );
+    return {
+      entries,
+      ...(previous.rows[0] ? { before: n(previous.rows[0].id) } : {}),
+    };
   }
 
   async docs(conversationId: number): Promise<Record<string, JsonObject>> {

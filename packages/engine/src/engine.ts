@@ -262,6 +262,13 @@ export class Engine {
     const engine = new Engine(options);
     const rootId = await engine.storage.ensureRoot();
     await seedConversation(engine.storage, rootId, engine.model);
+    // A crash can leave a phantom run/generation doc on any conversation; a
+    // fresh process owns no live state, so clear every conversation's live doc.
+    for (const summary of await engine.storage.listConversations(true)) {
+      if (summary.id !== rootId) {
+        await engine.storage.putDoc(summary.id, "pi.live", {});
+      }
+    }
     await engine.resume();
     return engine;
   }
