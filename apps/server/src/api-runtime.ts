@@ -24,7 +24,10 @@ import type {
   PushSubscription,
 } from "@ribhu-voyager/protocol";
 import { Db, serializedStorage } from "@ribhu-voyager/storage-sqlite";
-import { PostgresStorage } from "@ribhu-voyager/storage-postgres";
+import {
+  PostgresStorage,
+  createSharedPostgresStorage,
+} from "@ribhu-voyager/storage-postgres";
 
 import type { AuthInfo, AuthMode } from "./auth.js";
 import type { Config } from "./config.js";
@@ -120,9 +123,12 @@ export async function createApiRuntime(
 ): Promise<ApiRuntime> {
   await mkdir(config.dataDir, { recursive: true });
   const tenant = tenantId ?? config.tenantId ?? "default";
+  // One shared pg.Pool per URL per process; tenant RLS is set per transaction.
   const storage: Storage =
     config.storage === "postgres" && config.postgresUrl
-      ? new PostgresStorage(config.postgresUrl, tenant)
+      ? createSharedPostgresStorage(config.postgresUrl, tenant, {
+          max: config.postgresPoolMax,
+        })
       : serializedStorage(new Db(join(config.dataDir, "ribhu.sqlite")));
   if (storage instanceof PostgresStorage) await storage.init();
   const rootId = await storage.ensureRoot();

@@ -442,6 +442,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 | `RIBBHU_COST_MICROS_PER_1K_TOKENS` | `0` | Usage pricing for quota/dashboard cost reporting |
 | `RIBBHU_STORAGE` | `sqlite` | `sqlite` or `postgres` |
 | `RIBBHU_POSTGRES_URL` | unset | Postgres URL when storage is `postgres` |
+| `RIBBHU_POSTGRES_POOL_MAX` | `10` | Max connections in the per-URL shared Postgres pool |
 | `RIBBHU_DEMO` | unset | `1` forces the scripted provider |
 | `RIBBHU_WINDOW_ENTRIES` | `100` | Max transcript entries in a view |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434/v1` | Local Ollama endpoint |
@@ -452,7 +453,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 ## Tests and development
 
 ```bash
-npm test          # 153 tests
+npm test          # 154 tests
 npm run typecheck
 npm run build
 npm run dev
@@ -536,9 +537,11 @@ next step. See [docs/ARCHITECTURE-UPGRADE.md](docs/ARCHITECTURE-UPGRADE.md) and 
   runtimes, capped at `RIBBHU_MAX_TENANT_RUNTIMES` (default 20; new tenants past the cap get HTTP
   503, existing tenants keep working). Idle runtimes (no WebSocket clients) are evicted after
   `RIBBHU_TENANT_RUNTIME_TTL_MS` (default 10m); active clients are never evicted and capacity
-  pressure reclaims the least-recently-used idle runtime first. Workers still bind to
-  `RIBBHU_TENANT`, and there is no worker autoscaler or shared worker pool; per-request shared-pool
-  tenancy is not implemented. See [docs/MULTI-TENANT.md](docs/MULTI-TENANT.md).
+  pressure reclaims the least-recently-used idle runtime first. Tenant storages share one
+  reference-counted `pg.Pool` per URL (bounded by `RIBBHU_POSTGRES_POOL_MAX`, default 10) and set
+  `app.tenant_id` per transaction with `SET LOCAL`, so RLS is enforced for every operation outside
+  explicit transactions too. Workers still bind to `RIBBHU_TENANT`, and there is no worker
+  autoscaler or shared worker pool. See [docs/MULTI-TENANT.md](docs/MULTI-TENANT.md).
 - **RLS requires the right role.** A superuser or `BYPASSRLS` role silently bypasses row security.
   Provision a dedicated `NOSUPERUSER NOBYPASSRLS` app role.
 - **Approvals are single-user and non-cryptographic.** `ask` pauses risky tools, survives restart, and

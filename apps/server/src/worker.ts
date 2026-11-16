@@ -15,7 +15,10 @@ import {
 } from "@ribhu-voyager/engine";
 import { createProvider } from "@ribhu-voyager/providers";
 import { Db, serializedStorage } from "@ribhu-voyager/storage-sqlite";
-import { PostgresStorage } from "@ribhu-voyager/storage-postgres";
+import {
+  PostgresStorage,
+  createSharedPostgresStorage,
+} from "@ribhu-voyager/storage-postgres";
 
 import { AuthManager } from "./auth.js";
 import { PiAuthStore, defaultAuthFile } from "./auth-store.js";
@@ -78,9 +81,14 @@ export async function startWorker(
   await mkdir(config.dataDir, { recursive: true });
   await mkdir(config.workspaceDir, { recursive: true });
 
+  // Shared pool: the worker and any API runtime in this process reuse it.
   const storage: Storage =
     config.storage === "postgres" && config.postgresUrl
-      ? new PostgresStorage(config.postgresUrl, config.tenantId ?? "default")
+      ? createSharedPostgresStorage(
+          config.postgresUrl,
+          config.tenantId ?? "default",
+          { max: config.postgresPoolMax },
+        )
       : serializedStorage(new Db(join(config.dataDir, "ribhu.sqlite")));
   if (storage instanceof PostgresStorage) await storage.init();
   const authFile = defaultAuthFile();

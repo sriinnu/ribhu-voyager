@@ -4,3 +4,4 @@ export * from "./migrate.js";
 export * from "./tokens.js";
 export * from "./admin-tokens.js";
 export * from "./role.js";
+export * from "./shared-pool.js";

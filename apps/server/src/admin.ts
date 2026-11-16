@@ -13,6 +13,7 @@ import type {
 import { Db, serializedStorage } from "@ribhu-voyager/storage-sqlite";
 import {
   PostgresStorage,
+  createSharedPostgresStorage,
   resolveAdminToken,
 } from "@ribhu-voyager/storage-postgres";
 
@@ -172,7 +173,9 @@ export function createAdminApi(config: Config, deps: AdminDeps = {}): AdminApi {
     const cached = postgres.get(tenant);
     if (cached) return cached;
     const created = (async () => {
-      const instance = new PostgresStorage(config.postgresUrl!, tenant);
+      const instance = createSharedPostgresStorage(config.postgresUrl!, tenant, {
+        max: config.postgresPoolMax,
+      });
       await instance.init();
       return instance;
     })();

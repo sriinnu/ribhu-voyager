@@ -10,6 +10,10 @@ import {
   LATEST_SCHEMA_VERSION,
   PostgresStorage,
   closeApiTokenPools,
+  closeSharedPools,
+  createSharedPostgresStorage,
+  sharedPoolCount,
+  sharedPoolStats,
   issueApiToken,
   listApiTokens,
   migrateSqliteToPostgres,
@@ -386,6 +390,145 @@ test(
       await second.close().catch(() => undefined);
       try {
         execFileSync("docker", ["rm", "-f", RESERVATION_NAME], { stdio: "ignore" });
+      } catch {
+        /* container already gone */
+      }
+    }
+  },
+);
+
+const SHARED_POOL_PORT = 55450;
+const SHARED_POOL_NAME = `ribhu-pg-shared-pool-${process.pid}`;
+const SHARED_POOL_URL = `postgres://postgres:ribhu@127.0.0.1:${SHARED_POOL_PORT}/ribhu`;
+
+test(
+  "tenant storages share one ref-counted Postgres pool with per-transaction RLS",
+  { timeout: 120_000, skip: ready ? false : "docker/postgres image unavailable" },
+  async () => {
+    execFileSync("docker", [
+      "run",
+      "--rm",
+      "-d",
+      "--name",
+      SHARED_POOL_NAME,
+      "-e",
+      "POSTGRES_PASSWORD=ribhu",
+      "-e",
+      "POSTGRES_DB=ribhu",
+      "-p",
+      `${SHARED_POOL_PORT}:5432`,
+      IMAGE,
+    ]);
+    const admin = new PostgresStorage(SHARED_POOL_URL);
+    let tenantA: PostgresStorage | undefined;
+    let tenantB: PostgresStorage | undefined;
+    let recreated: PostgresStorage | undefined;
+    try {
+      let connected = false;
+      for (let attempt = 0; attempt < 240 && !connected; attempt += 1) {
+        try {
+          await admin.init({ migrate: true });
+          connected = true;
+        } catch {
+          await sleep(250);
+        }
+      }
+      assert.equal(connected, true);
+      await provisionAppRole(SHARED_POOL_URL, "ribhu_app", "ribhu_app");
+      const appUrl = `postgres://ribhu_app:ribhu_app@127.0.0.1:${SHARED_POOL_PORT}/ribhu`;
+
+      const poolsBefore = sharedPoolCount();
+      tenantA = createSharedPostgresStorage(appUrl, "tenant-a");
+      tenantB = createSharedPostgresStorage(appUrl, "tenant-b");
+      await tenantA.init();
+      await tenantB.init();
+
+      // One underlying pool, two references.
+      assert.equal(tenantA.pool, tenantB.pool, "tenants share the same pg.Pool");
+      assert.equal(
+        sharedPoolCount(),
+        poolsBefore + 1,
+        "a single shared pool was created for the URL",
+      );
+      const stats = sharedPoolStats().find(
+        (entry) => entry.connectionString === appUrl,
+      );
+      assert.equal(stats?.refs, 2, "pool is ref-counted per tenant storage");
+
+      const rootA = await tenantA.ensureRoot();
+      const rootB = await tenantB.ensureRoot();
+      assert.notEqual(rootA, rootB);
+      await tenantA.admitSubmission(rootA, "shared-r1", "alpha only");
+      // RLS is enforced per transaction even though methods take no explicit tx.
+      assert.equal((await tenantB.view(rootA)).entries.length, 0);
+      assert.equal((await tenantA.view(rootA)).entries.length, 1);
+      assert.deepEqual(
+        (await tenantA.listConversations()).map((conversation) => conversation.id),
+        [rootA],
+      );
+      assert.deepEqual(
+        (await tenantB.listConversations()).map((conversation) => conversation.id),
+        [rootB],
+      );
+
+      // Nested tx joins the outer transaction and rolls it back as one unit.
+      await assert.rejects(
+        tenantA!.tx(async () => {
+          await tenantA!.tx(async () => {
+            await tenantA!.createConversation("inside nested tx");
+            throw new Error("nested rollback");
+          });
+        }),
+        /nested rollback/,
+      );
+      const afterRollback = await tenantA!.listConversations();
+      assert.ok(
+        !afterRollback.some(
+          (conversation) => conversation.title === "inside nested tx",
+        ),
+        "nested tx participates in the outer rollback",
+      );
+
+      const sharedPool = tenantA.pool;
+      await tenantA.close();
+      tenantA = undefined;
+      // Closing one tenant storage must not end the pool for the other.
+      assert.deepEqual(
+        (await tenantB.listConversations()).map((conversation) => conversation.id),
+        [rootB],
+      );
+      assert.equal(
+        sharedPoolStats().find((entry) => entry.connectionString === appUrl)?.refs,
+        1,
+      );
+
+      await tenantB.close();
+      tenantB = undefined;
+      assert.equal(
+        sharedPoolStats().some((entry) => entry.connectionString === appUrl),
+        false,
+        "the last close removes the shared pool",
+      );
+      await assert.rejects(
+        sharedPool.query("SELECT 1"),
+        /after calling end|Cannot use a pool/i,
+        "the underlying pool was ended",
+      );
+
+      // A later tenant storage gets a fresh pool (not the ended one).
+      recreated = createSharedPostgresStorage(appUrl, "tenant-a");
+      await recreated.init();
+      assert.notEqual(recreated.pool, sharedPool, "a new pool is created on demand");
+      await recreated.listConversations();
+    } finally {
+      await tenantA?.close().catch(() => undefined);
+      await tenantB?.close().catch(() => undefined);
+      await recreated?.close().catch(() => undefined);
+      await admin.close().catch(() => undefined);
+      await closeSharedPools();
+      await closeApiTokenPools();
+      try {
+        execFileSync("docker", ["rm", "-f", SHARED_POOL_NAME], { stdio: "ignore" });
       } catch {
         /* container already gone */
       }

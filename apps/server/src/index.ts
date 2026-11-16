@@ -8,8 +8,9 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { describeConfig, loadConfig } from "./config.js";
 import { attachGateway, createRateLimiter } from "./gateway.js";
 import {
-  PostgresStorage,
   closeApiTokenPools,
+  closeSharedPools,
+  createSharedPostgresStorage,
   resolveApiToken,
 } from "@ribhu-voyager/storage-postgres";
 import { Db } from "@ribhu-voyager/storage-sqlite";
@@ -82,9 +83,10 @@ const config = loadConfig();
 if (config.migrateOnly) {
   try {
     if (config.storage === "postgres" && config.postgresUrl) {
-      const schema = new PostgresStorage(
+      const schema = createSharedPostgresStorage(
         config.postgresUrl,
         config.tenantId ?? "default",
+        { max: config.postgresPoolMax },
       );
       try {
         const version = await schema.migrateSchema();
@@ -110,9 +112,10 @@ if (config.migrateOnly) {
 // R10: verify (never migrate) the hosted schema before serving, so a stale
 // database fails startup with the remediation message instead of a 500 later.
 if (config.storage === "postgres" && config.postgresUrl) {
-  const probe = new PostgresStorage(
+  const probe = createSharedPostgresStorage(
     config.postgresUrl,
     config.tenantId ?? "default",
+    { max: config.postgresPoolMax },
   );
   try {
     await probe.init();
@@ -275,6 +278,7 @@ const shutdown = async (signal: string) => {
     await admin.close();
     await pool.close();
     await closeApiTokenPools();
+    await closeSharedPools();
   } finally {
     server.close();
     process.exit(0);

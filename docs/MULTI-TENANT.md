@@ -9,11 +9,12 @@ runtime (storage, engine, auth) is created lazily and cached per tenant.
 PWA / API client
    │  token
    ▼
-API (runtime pool) ──▶ tenant-a runtime ──▶ Postgres RLS (tenant-a)
-   │                 └▶ tenant-b runtime ──▶ Postgres RLS (tenant-b)
+API (runtime pool) ──▶ tenant-a storage ─┐
+   │                 └▶ tenant-b storage ─┤──▶ one shared pg.Pool
+   │                           each statement: BEGIN; SET LOCAL app.tenant_id; …; COMMIT
    │
    └── WebSocket / health per token
-Worker A (RIBBHU_TENANT=tenant-a) ──▶ tenant-a jobs
+Worker A (RIBBHU_TENANT=tenant-a) ──▶ tenant-a jobs   (same shared pool in that process)
 Worker B (RIBBHU_TENANT=tenant-b) ──▶ tenant-b jobs
 ```
 
@@ -21,7 +22,28 @@ Worker B (RIBBHU_TENANT=tenant-b) ──▶ tenant-b jobs
 - Run **one worker per tenant**: workers still bind to `RIBBHU_TENANT`. There is no worker
   autoscaler or cross-tenant job router yet.
 - Postgres must use a `NOSUPERUSER NOBYPASSRLS` role; RLS separates conversations, entries, docs,
-  submissions, jobs, tool tasks, settings, and cancels.
+  submissions, jobs, tool tasks, settings, cancels, usage events, audit events, and the quota tables.
+
+## Shared connection pool (R6)
+
+Tenant isolation is per **transaction**, not per connection pool:
+
+- One `pg.Pool` per Postgres URL per process (`createSharedPostgresStorage`), shared by every
+  tenant `PostgresStorage` the API process, worker, and admin reader create for that URL.
+- Every public storage operation runs in a transaction that starts with
+  `SELECT set_config('app.tenant_id', $tenant, true)` (transaction-local `SET LOCAL`). Single
+  statements get their own short transaction; `storage.tx(fn)` opens one transaction and nested
+  `storage.tx`/storage calls join it, so the tenant is always set when RLS is evaluated.
+- `close()` is **ref-counted**: it releases that tenant storage's reference and leaves the pool
+  running for other tenants. The pool is ended when the last storage for the URL closes;
+  `closeSharedPools()` force-closes all pools on process shutdown, and `sharedPoolStats()` /
+  `sharedPoolCount()` expose ref counts and pool counters for tests/health tooling.
+- `RIBBHU_POSTGRES_POOL_MAX` (default `10`) bounds the shared pool size.
+- `PostgresStorage.pool` stays available for raw admin queries (used by the CLI/tests); such raw
+  queries bypass the tenant wrapper, so they need admin credentials/superuser.
+
+This removes the earlier "one pool per tenant runtime" cost: adding/evicting a tenant runtime no
+longer opens a new pool, and many tenants multiplex over the same bounded connection set.
 
 ## Tokens
 
@@ -95,12 +117,12 @@ tenants.
 ## Limits
 
 - No tenant provisioning/admin API, per-tenant quotas, billing, or audit dashboard.
-- Workers are deployed per tenant; no shared worker pool.
+- Workers are deployed per tenant; no shared worker pool or autoscaler.
 - No token rotation UI beyond the CLI (`issue` / `revoke`).
 - The API process holds one runtime per active tenant up to `RIBBHU_MAX_TENANT_RUNTIMES`; capacity
-  planning is per process.
-- **Residual limitation (R6):** true per-request shared-pool tenancy is not implemented. Each
-  tenant still gets its own runtime/storage pool (and its own worker); eviction only reclaims
-  fully idle tenants past the TTL, so a burst of many distinct tenants can still hit the 503 cap
-  until idle runtimes expire. Plan one worker per tenant; this is not a shared worker pool or
-  autoscaler.
+  planning is per process. Tenant storage shares one ref-counted pool per URL, so the cap now
+  bounds engine/runtime handles, not Postgres connections. Eviction still only reclaims fully idle
+  tenants past the TTL, so bursts of many distinct tenants can hit the 503 cap until idle runtimes
+  expire.
+- The remaining worker limitation is architectural: jobs are not routed across tenants, so plan one
+  worker process per tenant (each worker has its own shared pool for that process).

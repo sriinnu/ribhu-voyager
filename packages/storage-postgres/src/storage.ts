@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { Pool, type PoolClient } from "pg";
+import { Pool, type PoolClient, type QueryResult, type QueryResultRow } from "pg";
 
 import {
   QUOTA_DAILY_TOKENS_KEY,
@@ -31,6 +31,7 @@ import {
 import { QuotaExceeded, StaleFence } from "@ribhu-voyager/engine";
 
 import { LATEST_SCHEMA_VERSION, MIGRATIONS } from "./migrations.js";
+import { acquirePool, type PoolLease } from "./shared-pool.js";
 
 const now = () => Date.now();
 const n = (value: unknown): number => Number(value);
@@ -145,42 +146,52 @@ function entry(row: Record<string, unknown>): EntryRecord {
  * synchronous SQLite port. This is the foundation for the worker pool.
  */
 export class PostgresStorage implements Storage {
+  /** Shared pool for this connection string (also used for raw admin queries). */
   readonly pool: Pool;
   readonly tenantId: string;
+  readonly connectionString: string;
+  private readonly lease: PoolLease;
   private readonly txContext = new AsyncLocalStorage<PoolClient>();
+  private closed = false;
 
-  constructor(connectionString: string, tenantId = "default") {
+  constructor(
+    connectionString: string,
+    tenantId = "default",
+    options: { max?: number } = {},
+  ) {
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(tenantId)) {
       throw new Error("tenant id must be 1-64 alphanumeric, dash, or underscore");
     }
     this.tenantId = tenantId;
-    this.pool = new Pool({
-      connectionString,
-      options: `-c app.tenant_id=${tenantId}`,
-    });
+    this.connectionString = connectionString;
+    // One pool per URL per process, shared by every tenant storage instance.
+    this.lease = acquirePool(connectionString, options);
+    this.pool = this.lease.pool;
   }
 
-  private db(): Pool | PoolClient {
-    return this.txContext.getStore() ?? this.pool;
+  private assertOpen(): void {
+    if (this.closed) throw new Error("PostgresStorage has been closed.");
   }
 
-  /** Reject a fenced write once this worker no longer owns the job/fence. */
-  private async assertFence(guard?: WriteGuard): Promise<void> {
-    if (!guard) return;
-    const result = await this.db().query(
-      `SELECT 1 FROM jobs
-       WHERE id = $1 AND owner = $2 AND status = 'running'
-         AND lease_until > $3 AND fence = $4`,
-      [guard.jobId, guard.owner, now(), guard.fence],
-    );
-    if ((result.rowCount ?? 0) === 0) throw new StaleFence();
-  }
-
-  async tx<T>(fn: () => Awaitable<T>): Promise<T> {
+  /**
+   * Run `fn` inside a transaction that has set the tenant for RLS via
+   * `SET LOCAL app.tenant_id`. Nested calls join the current transaction (they
+   * already have the tenant set), and every public operation goes through here
+   * or `q`, so RLS is enforced even outside an explicit `tx`.
+   */
+  private async withTenant<T>(
+    fn: (client: PoolClient) => Promise<T>,
+  ): Promise<T> {
+    const existing = this.txContext.getStore();
+    if (existing) return await fn(existing);
+    this.assertOpen();
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const result = await this.txContext.run(client, fn);
+      await client.query("SELECT set_config('app.tenant_id', $1, true)", [
+        this.tenantId,
+      ]);
+      const result = await this.txContext.run(client, () => fn(client));
       await client.query("COMMIT");
       return result;
     } catch (error) {
@@ -189,6 +200,31 @@ export class PostgresStorage implements Storage {
     } finally {
       client.release();
     }
+  }
+
+  /** Tenant-scoped single statement (joins an active transaction if any). */
+  private async q<R extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: unknown[],
+  ): Promise<QueryResult<R>> {
+    return await this.withTenant((client) => client.query<R>(sql, params));
+  }
+
+  /** Reject a fenced write once this worker no longer owns the job/fence. */
+  private async assertFence(guard?: WriteGuard): Promise<void> {
+    if (!guard) return;
+    const result = await this.q(
+      `SELECT 1 FROM jobs
+       WHERE id = $1 AND owner = $2 AND status = 'running'
+         AND lease_until > $3 AND fence = $4`,
+      [guard.jobId, guard.owner, now(), guard.fence],
+    );
+    if ((result.rowCount ?? 0) === 0) throw new StaleFence();
+  }
+
+  /** Tenant-scoped transaction; nested calls join the active transaction. */
+  async tx<T>(fn: () => Awaitable<T>): Promise<T> {
+    return await this.withTenant(async () => await fn());
   }
 
   /**
@@ -311,15 +347,18 @@ export class PostgresStorage implements Storage {
     }
   }
 
+  /**
+   * Release this instance's reference to the shared pool. The pool is ended
+   * only when the last tenant storage using it closes.
+   */
   async close(): Promise<void> {
-    await this.pool.end();
+    if (this.closed) return;
+    this.closed = true;
+    await this.lease.release();
   }
 
-  private async bump(
-    client: PoolClient | Pool,
-    conversationId: number,
-  ): Promise<void> {
-    await client.query(
+  private async bump(conversationId: number): Promise<void> {
+    await this.q(
       "UPDATE conversations SET version = version + 1, updated_at = $1 WHERE id = $2",
       [now(), conversationId],
     );
@@ -327,12 +366,12 @@ export class PostgresStorage implements Storage {
 
   async ensureRoot(): Promise<number> {
     return this.tx(async () => {
-      await this.db().query("SELECT pg_advisory_xact_lock(727275)");
-      const existing = await this.db().query(
+      await this.q("SELECT pg_advisory_xact_lock(727275)");
+      const existing = await this.q(
         "SELECT id FROM conversations ORDER BY id ASC LIMIT 1",
       );
       if (existing.rows[0]) return n(existing.rows[0].id);
-      const created = await this.db().query(
+      const created = await this.q(
         `INSERT INTO conversations(version, title, tenant_id, created_at, updated_at)
          VALUES(0, 'Ribhu Voyager', $1, $2, $2) RETURNING id`,
         [this.tenantId, now()],
@@ -342,7 +381,7 @@ export class PostgresStorage implements Storage {
   }
 
   async createConversation(title = "New conversation"): Promise<number> {
-    const created = await this.db().query(
+    const created = await this.q(
       `INSERT INTO conversations(version, title, tenant_id, created_at, updated_at)
        VALUES(0, $1, $2, $3, $3) RETURNING id`,
       [title, this.tenantId, now()],
@@ -351,7 +390,7 @@ export class PostgresStorage implements Storage {
   }
 
   async version(id: number): Promise<number> {
-    const result = await this.db().query(
+    const result = await this.q(
       "SELECT version FROM conversations WHERE id = $1",
       [id],
     );
@@ -359,7 +398,7 @@ export class PostgresStorage implements Storage {
   }
 
   async conversationExists(id: number): Promise<boolean> {
-    const result = await this.db().query(
+    const result = await this.q(
       "SELECT 1 FROM conversations WHERE id = $1",
       [id],
     );
@@ -369,7 +408,7 @@ export class PostgresStorage implements Storage {
   async listConversations(
     includeArchived = false,
   ): Promise<ConversationSummary[]> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT id, title, parent_id, fork_entry_id, archived_at, created_at, updated_at
        FROM conversations
        ${includeArchived ? "" : "WHERE archived_at IS NULL"}
@@ -387,21 +426,21 @@ export class PostgresStorage implements Storage {
   }
 
   async renameConversation(id: number, title: string): Promise<void> {
-    await this.db().query(
+    await this.q(
       "UPDATE conversations SET title = $1, updated_at = $2 WHERE id = $3",
       [title.trim().slice(0, 120), now(), id],
     );
   }
 
   async archiveConversation(id: number, archived: boolean): Promise<void> {
-    await this.db().query(
+    await this.q(
       "UPDATE conversations SET archived_at = $1, updated_at = $2 WHERE id = $3",
       [archived ? now() : null, now(), id],
     );
   }
 
   async lastEntry(conversationId: number): Promise<EntryRecord | undefined> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT id, conversation_id, kind, model, data, by_task_id
        FROM entries WHERE conversation_id = $1 ORDER BY id DESC LIMIT 1`,
       [conversationId],
@@ -413,7 +452,7 @@ export class PostgresStorage implements Storage {
     conversationId: number,
     kind: string,
   ): Promise<EntryRecord | undefined> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT id, conversation_id, kind, model, data, by_task_id
        FROM entries WHERE conversation_id = $1 AND kind = $2 ORDER BY id DESC LIMIT 1`,
       [conversationId, kind],
@@ -425,10 +464,8 @@ export class PostgresStorage implements Storage {
     parentId: number,
     atEntryId?: number,
   ): Promise<number> {
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const parent = await client.query(
+    return await this.tx(async () => {
+      const parent = await this.q(
         "SELECT id, title FROM conversations WHERE id = $1",
         [parentId],
       );
@@ -438,13 +475,13 @@ export class PostgresStorage implements Storage {
         last ??
         n(
           (
-            await client.query(
+            await this.q(
               "SELECT COALESCE(MAX(id), 0) AS id FROM entries WHERE conversation_id = $1",
               [parentId],
             )
           ).rows[0].id,
         );
-      const child = await client.query(
+      const child = await this.q(
         `INSERT INTO conversations(
            version, title, parent_id, fork_entry_id, tenant_id, created_at, updated_at
          ) VALUES(0, $1, $2, $3, $4, $5, $5) RETURNING id`,
@@ -457,33 +494,27 @@ export class PostgresStorage implements Storage {
         ],
       );
       const childId = n(child.rows[0].id);
-      await client.query(
+      await this.q(
         `INSERT INTO entries(conversation_id, kind, model, data, by_task_id, tenant_id, created_at)
          SELECT $1, kind, model, data, by_task_id, $2, created_at
          FROM entries WHERE conversation_id = $3 AND id <= $4 ORDER BY id`,
         [childId, this.tenantId, parentId, cutoff],
       );
-      await client.query(
+      await this.q(
         `INSERT INTO docs(conversation_id, kind, value, tenant_id)
          SELECT $1, kind, value, $2 FROM docs
          WHERE conversation_id = $3 AND kind = 'pi.agent'`,
         [childId, this.tenantId, parentId],
       );
-      await client.query(
+      await this.q(
         `INSERT INTO docs(conversation_id, kind, value, tenant_id)
          VALUES($1, 'pi.usage', '{"input":0,"output":0,"totalTokens":0}'::jsonb, $2)
          ON CONFLICT(conversation_id, kind) DO NOTHING`,
         [childId, this.tenantId],
       );
-      await this.bump(client, childId);
-      await client.query("COMMIT");
+      await this.bump(childId);
       return childId;
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   async searchConversations(
@@ -493,7 +524,7 @@ export class PostgresStorage implements Storage {
     const text = query.trim();
     if (text === "") return [];
     const like = `%${text}%`;
-    const result = await this.pool.query(
+    const result = await this.q(
       `SELECT c.id, c.title, c.parent_id, c.fork_entry_id, c.archived_at,
               c.created_at, c.updated_at,
               (SELECT ts_headline(
@@ -534,7 +565,7 @@ export class PostgresStorage implements Storage {
     conversationId: number,
     limit = 100,
   ): Promise<{ entries: EntryRecord[]; before?: number }> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT * FROM (
          SELECT id, conversation_id, kind, model, data, by_task_id
          FROM entries WHERE conversation_id = $1 ORDER BY id DESC LIMIT $2
@@ -543,7 +574,7 @@ export class PostgresStorage implements Storage {
     );
     const entries = result.rows.map(entry);
     if (entries.length === 0) return { entries };
-    const previous = await this.db().query(
+    const previous = await this.q(
       "SELECT id FROM entries WHERE conversation_id = $1 AND id < $2 ORDER BY id DESC LIMIT 1",
       [conversationId, entries[0]!.id],
     );
@@ -554,7 +585,7 @@ export class PostgresStorage implements Storage {
   }
 
   async docs(conversationId: number): Promise<Record<string, JsonObject>> {
-    const result = await this.db().query(
+    const result = await this.q(
       "SELECT kind, value FROM docs WHERE conversation_id = $1",
       [conversationId],
     );
@@ -602,9 +633,9 @@ export class PostgresStorage implements Storage {
          ) RETURNING id`;
       params.push(guard.jobId, guard.owner, guard.fence);
     }
-    const result = await this.db().query(sql, params);
+    const result = await this.q(sql, params);
     if (guard && result.rows.length === 0) throw new StaleFence();
-    await this.bump(this.db(), entryRow.conversationId);
+    await this.bump(entryRow.conversationId);
     return n(result.rows[0].id);
   }
 
@@ -613,14 +644,14 @@ export class PostgresStorage implements Storage {
     kind: string,
     value: JsonObject,
   ): Promise<void> {
-    await this.db().query(
+    await this.q(
       `INSERT INTO docs(conversation_id, kind, value, tenant_id)
        VALUES($1, $2, $3::jsonb, $4)
        ON CONFLICT(conversation_id, kind) DO UPDATE
        SET value = excluded.value, tenant_id = excluded.tenant_id`,
       [conversationId, kind, JSON.stringify(value), this.tenantId],
     );
-    await this.bump(this.db(), conversationId);
+    await this.bump(conversationId);
   }
 
   async createSubmission(
@@ -629,13 +660,13 @@ export class PostgresStorage implements Storage {
     content: string,
     whenBusy = "steer",
   ): Promise<SubmissionRow> {
-    const result = await this.db().query(
+    const result = await this.q(
       `INSERT INTO submissions(
          conversation_id, request_id, content, status, when_busy, tenant_id, created_at, updated_at
        ) VALUES($1, $2, $3, 'queued', $4, $5, $6, $6) RETURNING *`,
       [conversationId, requestId, content, whenBusy, this.tenantId, now()],
     );
-    await this.bump(this.db(), conversationId);
+    await this.bump(conversationId);
     return submission(result.rows[0]);
   }
 
@@ -643,23 +674,26 @@ export class PostgresStorage implements Storage {
     conversationId: number,
     requestId: string,
   ): Promise<SubmissionRow | undefined> {
-    const result = await this.db().query(
+    const result = await this.q(
       "SELECT * FROM submissions WHERE conversation_id = $1 AND request_id = $2",
       [conversationId, requestId],
     );
     return result.rows[0] ? submission(result.rows[0]) : undefined;
   }
 
+  /**
+   * Legacy direct admission helper used by the storage-level tests/CLI. Server
+   * admission goes through the engine's `admitSubmission`; both rely on the
+   * tenant-scoped transaction wrapper for RLS.
+   */
   async admitSubmission(
     conversationId: number,
     requestId: string,
     content: string,
     whenBusy = "steer",
   ): Promise<SubmissionRow> {
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const inserted = await client.query(
+    return await this.tx(async () => {
+      const inserted = await this.q(
         `INSERT INTO submissions(
            conversation_id, request_id, content, status, when_busy, tenant_id, created_at, updated_at
          ) VALUES($1, $2, $3, 'queued', $4, $5, $6, $6)
@@ -669,7 +703,7 @@ export class PostgresStorage implements Storage {
       );
       if (inserted.rows[0]) {
         const row = submission(inserted.rows[0]);
-        await client.query(
+        await this.q(
           `INSERT INTO entries(conversation_id, kind, model, data, tenant_id, created_at)
            VALUES($1, 'pi.user', $2::jsonb, $3::jsonb, $4, $5)`,
           [
@@ -682,7 +716,7 @@ export class PostgresStorage implements Storage {
             now(),
           ],
         );
-        await client.query(
+        await this.q(
           `INSERT INTO jobs(conversation_id, kind, status, tenant_id, created_at, updated_at)
            SELECT $1, 'run', 'pending', $2, $3, $3
            WHERE NOT EXISTS (
@@ -691,22 +725,15 @@ export class PostgresStorage implements Storage {
            )`,
           [conversationId, this.tenantId, now()],
         );
-        await this.bump(client, conversationId);
-        await client.query("COMMIT");
+        await this.bump(conversationId);
         return row;
       }
-      const existing = await client.query(
+      const existing = await this.q(
         "SELECT * FROM submissions WHERE conversation_id = $1 AND request_id = $2",
         [conversationId, requestId],
       );
-      await client.query("COMMIT");
       return submission(existing.rows[0]);
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   async updateSubmission(
@@ -716,7 +743,7 @@ export class PostgresStorage implements Storage {
     guard?: WriteGuard,
   ): Promise<void> {
     await this.assertFence(guard);
-    await this.db().query(
+    await this.q(
       `UPDATE submissions SET status = $1, answer_entry_id = $2, error = $3, updated_at = $4
        WHERE id = $5 AND status NOT IN ('done','failed','aborted')`,
       [status, options.answerEntryId ?? null, options.error ?? null, now(), id],
@@ -731,7 +758,7 @@ export class PostgresStorage implements Storage {
   ): Promise<void> {
     if (ids.length === 0) return;
     await this.assertFence(guard);
-    await this.db().query(
+    await this.q(
       `UPDATE submissions SET status = $1,
          answer_entry_id = COALESCE($2, answer_entry_id), error = $3, updated_at = $4
        WHERE id = ANY($5::int[]) AND status NOT IN ('done','failed','aborted')`,
@@ -740,7 +767,7 @@ export class PostgresStorage implements Storage {
   }
 
   async queuedSubmissions(conversationId: number): Promise<SubmissionRow[]> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT * FROM submissions
        WHERE conversation_id = $1 AND status IN ('queued','running') ORDER BY id ASC`,
       [conversationId],
@@ -749,7 +776,7 @@ export class PostgresStorage implements Storage {
   }
 
   async busy(conversationId: number): Promise<boolean> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT 1 FROM submissions
        WHERE conversation_id = $1 AND status IN ('queued','running')
        UNION ALL
@@ -762,7 +789,7 @@ export class PostgresStorage implements Storage {
   }
 
   async enqueueRun(conversationId: number): Promise<void> {
-    await this.db().query(
+    await this.q(
       `INSERT INTO jobs(conversation_id, kind, status, tenant_id, created_at, updated_at)
        VALUES($1, 'run', 'pending', $2, $3, $3)
        ON CONFLICT DO NOTHING`,
@@ -771,7 +798,7 @@ export class PostgresStorage implements Storage {
   }
 
   async enqueueCompact(conversationId: number): Promise<void> {
-    await this.db().query(
+    await this.q(
       `INSERT INTO jobs(conversation_id, kind, status, tenant_id, created_at, updated_at)
        VALUES($1, 'compact', 'pending', $2, $3, $3)
        ON CONFLICT DO NOTHING`,
@@ -788,7 +815,7 @@ export class PostgresStorage implements Storage {
     return await this.tx(async () => {
       const timestamp = now();
       const leaseUntil = timestamp + leaseMs;
-      const candidate = await this.db().query(
+      const candidate = await this.q(
         `SELECT j.id, j.conversation_id FROM jobs j
          WHERE (j.status = 'pending' OR (j.status = 'running' AND j.lease_until < $1))
            AND NOT EXISTS (
@@ -801,10 +828,10 @@ export class PostgresStorage implements Storage {
       );
       const row = candidate.rows[0];
       if (!row) return undefined;
-      await this.db().query("SELECT pg_advisory_xact_lock(727274, $1)", [
+      await this.q("SELECT pg_advisory_xact_lock(727274, $1)", [
         n(row.conversation_id),
       ]);
-      const result = await this.db().query(
+      const result = await this.q(
         `UPDATE jobs AS j SET status = 'running', owner = $1, lease_until = $2,
            fence = j.fence + 1, updated_at = $3
          WHERE j.id = $4
@@ -839,7 +866,7 @@ export class PostgresStorage implements Storage {
     leaseMs: number,
     fence?: number,
   ): Promise<boolean> {
-    const result = await this.db().query(
+    const result = await this.q(
       `UPDATE jobs SET lease_until = $1, updated_at = $2
        WHERE id = $3 AND owner = $4 AND status = 'running'
          ${fence === undefined ? "" : "AND fence = $5"} RETURNING id`,
@@ -851,7 +878,7 @@ export class PostgresStorage implements Storage {
   }
 
   async finishRun(jobId: number, owner: string): Promise<void> {
-    await this.db().query("DELETE FROM jobs WHERE id = $1 AND owner = $2", [
+    await this.q("DELETE FROM jobs WHERE id = $1 AND owner = $2", [
       jobId,
       owner,
     ]);
@@ -862,7 +889,7 @@ export class PostgresStorage implements Storage {
     owner: string,
     fence?: number,
   ): Promise<boolean> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT 1 FROM jobs
        WHERE id = $1 AND owner = $2 AND status = 'running' AND lease_until > $3
          ${fence === undefined ? "" : "AND fence = $4"}`,
@@ -874,7 +901,7 @@ export class PostgresStorage implements Storage {
   }
 
   async conversationIdsWithOpenWork(): Promise<number[]> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT DISTINCT conversation_id FROM submissions
        WHERE status IN ('queued','running')
        UNION
@@ -919,7 +946,7 @@ export class PostgresStorage implements Storage {
          ) RETURNING *`;
       params.push(guard.jobId, guard.owner, guard.fence);
     }
-    const result = await this.db().query(sql, params);
+    const result = await this.q(sql, params);
     if (guard && result.rows.length === 0) throw new StaleFence();
     return this.toolTask(result.rows[0]);
   }
@@ -943,7 +970,7 @@ export class PostgresStorage implements Storage {
     conversationId: number,
     callId: string,
   ): Promise<ToolTaskRow | undefined> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT * FROM tool_tasks
        WHERE conversation_id = $1 AND call_id = $2 ORDER BY id DESC LIMIT 1`,
       [conversationId, callId],
@@ -959,7 +986,7 @@ export class PostgresStorage implements Storage {
   ): Promise<void> {
     const timestamp = now();
     if (guard) {
-      const updated = await this.db().query(
+      const updated = await this.q(
         `UPDATE tool_tasks SET result = $1, status = $2, updated_at = $3
          WHERE id = $4 AND EXISTS (
            SELECT 1 FROM jobs
@@ -971,7 +998,7 @@ export class PostgresStorage implements Storage {
       if ((updated.rowCount ?? 0) === 0) throw new StaleFence();
       return;
     }
-    await this.db().query(
+    await this.q(
       "UPDATE tool_tasks SET result = $1, status = $2, updated_at = $3 WHERE id = $4",
       [result, status, timestamp, id],
     );
@@ -980,10 +1007,10 @@ export class PostgresStorage implements Storage {
   async runningToolTasks(conversationId?: number): Promise<ToolTaskRow[]> {
     const result =
       conversationId === undefined
-        ? await this.db().query(
+        ? await this.q(
             "SELECT * FROM tool_tasks WHERE status = 'running' ORDER BY id",
           )
-        : await this.db().query(
+        : await this.q(
             "SELECT * FROM tool_tasks WHERE conversation_id = $1 AND status = 'running' ORDER BY id",
             [conversationId],
           );
@@ -991,7 +1018,7 @@ export class PostgresStorage implements Storage {
   }
 
   async hasToolResult(conversationId: number, callId: string): Promise<boolean> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT 1 FROM entries
        WHERE conversation_id = $1 AND kind = 'pi.tool-result'
          AND model @> jsonb_build_array(jsonb_build_object('toolCallId', $2::text))
@@ -1006,7 +1033,7 @@ export class PostgresStorage implements Storage {
     running: number;
     oldestPendingAgeMs: number | null;
   }> {
-    const result = await this.db().query(
+    const result = await this.q(
       "SELECT status, COUNT(*)::int AS count FROM jobs GROUP BY status",
     );
     const stats = {
@@ -1018,7 +1045,7 @@ export class PostgresStorage implements Storage {
       if (row.status === "pending") stats.pending = n(row.count);
       if (row.status === "running") stats.running = n(row.count);
     }
-    const oldest = await this.db().query(
+    const oldest = await this.q(
       "SELECT MIN(created_at) AS oldest FROM jobs WHERE status = 'pending'",
     );
     if (oldest.rows[0]?.oldest !== null && oldest.rows[0]?.oldest !== undefined) {
@@ -1031,7 +1058,7 @@ export class PostgresStorage implements Storage {
   }
 
   async getSetting(key: string): Promise<string | undefined> {
-    const result = await this.db().query(
+    const result = await this.q(
       "SELECT value FROM settings WHERE key = $1",
       [key],
     );
@@ -1039,7 +1066,7 @@ export class PostgresStorage implements Storage {
   }
 
   async setSetting(key: string, value: string): Promise<void> {
-    await this.db().query(
+    await this.q(
       `INSERT INTO settings(tenant_id, key, value) VALUES($1, $2, $3)
        ON CONFLICT(tenant_id, key) DO UPDATE SET value = excluded.value`,
       [this.tenantId, key, value],
@@ -1048,7 +1075,7 @@ export class PostgresStorage implements Storage {
 
   async settingsMatching(prefix: string): Promise<SettingPair[]> {
     // Prefix match without LIKE escaping; RLS scopes rows to this tenant.
-    const result = await this.db().query(
+    const result = await this.q(
       "SELECT key, value FROM settings WHERE left(key, length($1)) = $1 ORDER BY key",
       [prefix],
     );
@@ -1063,7 +1090,7 @@ export class PostgresStorage implements Storage {
     const outputTokens = Math.max(0, Math.trunc(event.outputTokens));
     const costMicros = Math.max(0, Math.trunc(event.costMicros ?? 0));
     const createdAt = event.createdAt ?? now();
-    await this.db().query(
+    await this.q(
       `INSERT INTO usage_events(tenant_id, conversation_id, submission_id, provider, model,
                                  input_tokens, output_tokens, cost_micros, created_at)
        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
@@ -1081,7 +1108,7 @@ export class PostgresStorage implements Storage {
     );
     // Keep the row-locked quota counters in step with the usage journal.
     await this.quotaState(createdAt);
-    await this.db().query(
+    await this.q(
       `UPDATE quota_state
        SET day_tokens = day_tokens + $1,
            month_tokens = month_tokens + $1,
@@ -1093,7 +1120,7 @@ export class PostgresStorage implements Storage {
 
   async usageSummary(period: UsagePeriod): Promise<UsageSummary> {
     const since = periodStart(period);
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT COUNT(*)::int AS events,
               COALESCE(SUM(input_tokens), 0) AS input,
               COALESCE(SUM(output_tokens), 0) AS output,
@@ -1116,7 +1143,7 @@ export class PostgresStorage implements Storage {
   }
 
   async listUsage(limit = DEFAULT_LIST_LIMIT): Promise<UsageEvent[]> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT id, tenant_id, conversation_id, submission_id, provider, model,
               input_tokens, output_tokens, cost_micros, created_at
        FROM usage_events WHERE tenant_id = $1
@@ -1127,7 +1154,7 @@ export class PostgresStorage implements Storage {
   }
 
   async recordAudit(event: AuditEventInput): Promise<void> {
-    await this.db().query(
+    await this.q(
       `INSERT INTO audit_events(tenant_id, actor, action, target, data, created_at)
        VALUES($1, $2, $3, $4, $5, $6)`,
       [
@@ -1142,7 +1169,7 @@ export class PostgresStorage implements Storage {
   }
 
   async listAudit(limit = DEFAULT_LIST_LIMIT): Promise<AuditEvent[]> {
-    const result = await this.db().query(
+    const result = await this.q(
       `SELECT id, tenant_id, actor, action, target, data, created_at
        FROM audit_events WHERE tenant_id = $1
        ORDER BY created_at DESC, id DESC LIMIT $2`,
@@ -1179,13 +1206,13 @@ export class PostgresStorage implements Storage {
       throw new Error("retention cutoff must be a positive epoch-ms timestamp");
     }
     if (options.dryRun === true) {
-      const result = await this.db().query(
+      const result = await this.q(
         `SELECT count(*)::int AS count FROM ${table} WHERE created_at < $1`,
         [cutoff],
       );
       return n(result.rows[0]?.count);
     }
-    const result = await this.db().query(
+    const result = await this.q(
       `WITH deleted AS (
          DELETE FROM ${table} WHERE created_at < $1 RETURNING 1
        ) SELECT count(*)::int AS count FROM deleted`,
@@ -1223,7 +1250,7 @@ export class PostgresStorage implements Storage {
   }
 
   async listTenants(): Promise<string[]> {
-    const result = await this.db().query("SELECT id FROM tenants ORDER BY id");
+    const result = await this.q("SELECT id FROM tenants ORDER BY id");
     return result.rows.map((row) => String(row.id));
   }
 
@@ -1235,18 +1262,18 @@ export class PostgresStorage implements Storage {
   private async quotaState(timestamp: number): Promise<QuotaStateRow> {
     const day = utcDay(timestamp);
     const month = utcMonth(timestamp);
-    await this.db().query(
+    await this.q(
       `INSERT INTO quota_state(tenant_id, day, month) VALUES($1, $2, $3)
        ON CONFLICT(tenant_id) DO NOTHING`,
       [this.tenantId, day, month],
     );
-    const result = await this.db().query(
+    const result = await this.q(
       "SELECT * FROM quota_state WHERE tenant_id = $1 FOR UPDATE",
       [this.tenantId],
     );
     let row = result.rows[0]! as QuotaStateRow;
     if (row.day !== day) {
-      await this.db().query(
+      await this.q(
         `UPDATE quota_state SET day = $1, day_tokens = 0, day_reserved_tokens = 0
          WHERE tenant_id = $2`,
         [day, this.tenantId],
@@ -1254,7 +1281,7 @@ export class PostgresStorage implements Storage {
       row = { ...row, day, day_tokens: 0, day_reserved_tokens: 0 };
     }
     if (row.month !== month) {
-      await this.db().query(
+      await this.q(
         `UPDATE quota_state
          SET month = $1, month_tokens = 0, month_cost_micros = 0, month_reserved_cost_micros = 0
          WHERE tenant_id = $2`,
@@ -1274,11 +1301,11 @@ export class PostgresStorage implements Storage {
   async reserveQuota(
     request: QuotaReservationInput,
   ): Promise<QuotaReservation | undefined> {
-    const quota = await this.quota();
-    if (quota.dailyTokens === null && quota.monthlyCostMicros === null) {
-      return undefined;
-    }
     return await this.inTransaction(async () => {
+      const quota = await this.quota();
+      if (quota.dailyTokens === null && quota.monthlyCostMicros === null) {
+        return undefined;
+      }
       const timestamp = now();
       const state = await this.quotaState(timestamp);
       const tokens = Math.max(0, Math.trunc(request.tokens));
@@ -1304,7 +1331,7 @@ export class PostgresStorage implements Storage {
           );
         }
       }
-      const inserted = await this.db().query(
+      const inserted = await this.q(
         `INSERT INTO quota_reservations(
            tenant_id, conversation_id, submission_id, tokens, cost_micros,
            day, month, status, created_at, updated_at
@@ -1320,7 +1347,7 @@ export class PostgresStorage implements Storage {
           timestamp,
         ],
       );
-      await this.db().query(
+      await this.q(
         `UPDATE quota_state
          SET day_reserved_tokens = day_reserved_tokens + $1,
              month_reserved_cost_micros = month_reserved_cost_micros + $2
@@ -1336,7 +1363,7 @@ export class PostgresStorage implements Storage {
     status: "committed" | "released",
   ): Promise<void> {
     await this.inTransaction(async () => {
-      const found = await this.db().query(
+      const found = await this.q(
         "SELECT * FROM quota_reservations WHERE id = $1 FOR UPDATE",
         [reservationId],
       );
@@ -1346,14 +1373,14 @@ export class PostgresStorage implements Storage {
       const state = await this.quotaState(timestamp);
       const dayTokens = String(row.day) === state.day ? n(row.tokens) : 0;
       const monthCost = String(row.month) === state.month ? n(row.cost_micros) : 0;
-      await this.db().query(
+      await this.q(
         `UPDATE quota_state
          SET day_reserved_tokens = GREATEST(0, day_reserved_tokens - $1),
              month_reserved_cost_micros = GREATEST(0, month_reserved_cost_micros - $2)
          WHERE tenant_id = $3`,
         [dayTokens, monthCost, this.tenantId],
       );
-      await this.db().query(
+      await this.q(
         "UPDATE quota_reservations SET status = $1, updated_at = $2 WHERE id = $3 AND status = 'active'",
         [status, timestamp, reservationId],
       );
@@ -1371,7 +1398,7 @@ export class PostgresStorage implements Storage {
   async quotaReservationFor(
     submissionId: number,
   ): Promise<QuotaReservation | undefined> {
-    const result = await this.db().query(
+    const result = await this.q(
       "SELECT * FROM quota_reservations WHERE submission_id = $1 ORDER BY id DESC LIMIT 1",
       [submissionId],
     );
@@ -1379,7 +1406,7 @@ export class PostgresStorage implements Storage {
   }
 
   async requestCancel(conversationId: number): Promise<void> {
-    await this.db().query(
+    await this.q(
       `INSERT INTO cancels(conversation_id, requested_at, tenant_id) VALUES($1, $2, $3)
        ON CONFLICT(conversation_id) DO UPDATE SET requested_at = excluded.requested_at`,
       [conversationId, now(), this.tenantId],
@@ -1387,7 +1414,7 @@ export class PostgresStorage implements Storage {
   }
 
   async isCancelRequested(conversationId: number): Promise<boolean> {
-    const result = await this.db().query(
+    const result = await this.q(
       "SELECT 1 FROM cancels WHERE conversation_id = $1",
       [conversationId],
     );
@@ -1395,8 +1422,22 @@ export class PostgresStorage implements Storage {
   }
 
   async clearCancel(conversationId: number): Promise<void> {
-    await this.db().query("DELETE FROM cancels WHERE conversation_id = $1", [
+    await this.q("DELETE FROM cancels WHERE conversation_id = $1", [
       conversationId,
     ]);
   }
+}
+
+/**
+ * Create a tenant-scoped Postgres storage backed by the process-wide shared
+ * pool for `connectionString`. This is the factory server processes should use
+ * for API runtimes, workers and admin reads: every instance shares one
+ * `pg.Pool`, and tenant RLS is applied per transaction with `SET LOCAL`.
+ */
+export function createSharedPostgresStorage(
+  connectionString: string,
+  tenantId = "default",
+  options: { max?: number } = {},
+): PostgresStorage {
+  return new PostgresStorage(connectionString, tenantId, options);
 }

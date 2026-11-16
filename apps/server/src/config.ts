@@ -95,6 +95,8 @@ export type Config = {
   tenantRuntimeTtlMs?: number;
   /** R6: background idle-eviction sweep interval. Default 60000; 0 = no timer. */
   tenantEvictIntervalMs?: number;
+  /** Maximum connections in the process-wide shared Postgres pool. Default 10. */
+  postgresPoolMax?: number;
   /** True when startup generated a token instead of reading RIBBHU_TOKEN. */
   tokenGenerated?: boolean;
 };
@@ -446,6 +448,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const rateLimitPerMinute = parseRateLimit(env);
   const maxTenantRuntimes = parseMaxTenantRuntimes(env);
+  const postgresPoolMax = parsePositiveInt(
+    env.RIBBHU_POSTGRES_POOL_MAX?.trim(),
+    "RIBBHU_POSTGRES_POOL_MAX",
+    10,
+  );
   const tenantRuntimeTtlMs = parseNonNegativeInt(
     env.RIBBHU_TENANT_RUNTIME_TTL_MS?.trim(),
     "RIBBHU_TENANT_RUNTIME_TTL_MS",
@@ -478,6 +485,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxTenantRuntimes,
     tenantRuntimeTtlMs,
     tenantEvictIntervalMs,
+    postgresPoolMax,
     authMode,
     authSource,
     storage: storageRaw,
@@ -531,6 +539,7 @@ export function describeConfig(config: Config): string {
     }`,
     `  origins   ${config.allowedOrigins?.length ? config.allowedOrigins.join(", ") : "same-origin only"}`,
     `  rate      ${config.rateLimitPerMinute ? `${config.rateLimitPerMinute}/min per IP or token` : "disabled"}`,
+    `  pool      shared Postgres pool max ${config.postgresPoolMax ?? 10} connections`,
     `  tenants   ${config.maxTenantRuntimes && config.maxTenantRuntimes > 0 ? `cap ${config.maxTenantRuntimes} API runtimes (one worker per tenant)` : "API runtime cap unlimited (RIBBHU_MAX_TENANT_RUNTIMES=0)"}`,
     `  eviction  ${
       config.tenantRuntimeTtlMs === 0
