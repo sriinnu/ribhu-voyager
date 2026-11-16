@@ -60,6 +60,7 @@ export function runtimeInfo(runtime: ApiRuntime): ServerInfo {
     model: runtime.model.modelId,
     provider: runtime.model.provider,
     startedAt: runtime.startedAt,
+    ...(runtime.pushPublicKey ? { pushPublicKey: runtime.pushPublicKey } : {}),
   };
 }
 

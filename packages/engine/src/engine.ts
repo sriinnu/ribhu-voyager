@@ -111,6 +111,11 @@ export type EngineOptions = {
   compactionKeepEntries?: number;
   /** Tool policy. `ask` pauses before bash/write/edit for a journaled decision. */
   approvals?: ApprovalsMode;
+  /** Called once when a new approval request is journaled (push notification hook). */
+  onApprovalRequest?: (
+    conversationId: number,
+    request: { callId: string; name: string; args: JsonObject },
+  ) => void | Promise<void>;
   /** Start pending runs on open. Workers set false and run only claimed jobs. */
   autoRun?: boolean;
   recoverOnOpen?: boolean;
@@ -169,6 +174,7 @@ export class Engine {
   private readonly compactionThresholdChars: number;
   private readonly compactionKeepEntries: number;
   private readonly approvals: ApprovalsMode;
+  private readonly onApprovalRequest?: EngineOptions["onApprovalRequest"];
   private readonly autoRun: boolean;
   private readonly recoverOnOpen: boolean;
   private readonly log: (message: string) => void;
@@ -196,6 +202,7 @@ export class Engine {
     this.compactionThresholdChars = options.compactionThresholdChars ?? 240_000;
     this.compactionKeepEntries = options.compactionKeepEntries ?? 12;
     this.approvals = options.approvals ?? "allow";
+    this.onApprovalRequest = options.onApprovalRequest;
     this.autoRun = options.autoRun ?? true;
     this.recoverOnOpen = options.recoverOnOpen ?? true;
     this.log = options.log ?? (() => undefined);
@@ -1243,6 +1250,23 @@ ${data.summary}`
           `approval requested conversation=${conversationId} call=${call.id} tool=${call.name}`,
         );
         await this.emit(conversationId);
+        if (this.onApprovalRequest) {
+          void (async () => {
+            try {
+              await this.onApprovalRequest!(conversationId, {
+                callId: call.id,
+                name: call.name,
+                args: call.arguments,
+              });
+            } catch (error) {
+              this.log(
+                `approval notification failed: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }
+          })();
+        }
       } else if (latest.status === "approved") {
         return "approved";
       } else if (latest.status === "denied") {

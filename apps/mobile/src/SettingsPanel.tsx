@@ -20,9 +20,11 @@ import { tokenStorageLabel } from "./storage";
 export function SettingsPanel({
   gateway,
   token,
+  pushPublicKey,
 }: {
   gateway: string;
   token: string;
+  pushPublicKey?: string;
 }) {
   const [gatewayDraft, setGatewayDraft] = useState(gateway);
   const [tokenDraft, setTokenDraft] = useState(token);
@@ -32,6 +34,10 @@ export function SettingsPanel({
   const [notif, setNotif] = useState<NotificationSupport>(() =>
     notificationPermission(),
   );
+  const [pushState, setPushState] = useState<
+    "idle" | "enabling" | "enabled" | "error"
+  >("idle");
+  const [pushError, setPushError] = useState<string | null>(null);
 
   // Keep drafts in sync when the session applies new settings (save/reset).
   useEffect(() => {
@@ -53,6 +59,24 @@ export function SettingsPanel({
 
   const enableNotifications = async () => {
     setNotif(await requestNotificationPermission());
+  };
+
+  const enablePush = async () => {
+    setPushState("enabling");
+    setPushError(null);
+    const result = await session.enablePushNotifications();
+    if (result.ok) {
+      setPushState("enabled");
+    } else {
+      setPushState("error");
+      setPushError(result.error ?? "Could not enable push.");
+    }
+  };
+
+  const disablePush = async () => {
+    await session.disablePushNotifications();
+    setPushState("idle");
+    setPushError(null);
   };
 
   const supported = notificationsSupported();

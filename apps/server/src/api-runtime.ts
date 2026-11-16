@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -16,7 +16,10 @@ import {
   type SubmissionDraft,
   type SubmissionInfo,
 } from "@ribhu-voyager/engine";
-import type { ApprovalDecision } from "@ribhu-voyager/protocol";
+import type {
+  ApprovalDecision,
+  PushSubscription,
+} from "@ribhu-voyager/protocol";
 import { Db, serializedStorage } from "@ribhu-voyager/storage-sqlite";
 import { PostgresStorage } from "@ribhu-voyager/storage-postgres";
 
@@ -24,6 +27,10 @@ import type { AuthInfo, AuthMode } from "./auth.js";
 import type { Config } from "./config.js";
 
 const VIEW_POLL_MS = 120;
+
+function pushSettingKey(endpoint: string): string {
+  return `push:${createHash("sha256").update(endpoint).digest("hex")}`;
+}
 
 export type GatewayConversation = {
   id: number;
@@ -59,7 +66,15 @@ export type GatewayRuntime = {
   readonly serverId?: string;
   conversation(id?: number): Promise<GatewayConversation | undefined>;
   auth?: GatewayAuth;
-  storage?: { getSetting(key: string): Awaitable<string | undefined> };
+  storage?: {
+    getSetting(key: string): Awaitable<string | undefined>;
+    setSetting(key: string, value: string): Awaitable<void>;
+  };
+  /** Store or clear a Web Push subscription for this tenant/runtime. */
+  setPushSubscription?(
+    subscription: PushSubscription | null,
+    endpoint?: string,
+  ): Promise<void>;
   authInfo?(): Awaitable<AuthInfo | undefined>;
   listConversations?(
     includeArchived?: boolean,
@@ -80,6 +95,7 @@ export type ApiRuntime = GatewayRuntime & {
   demo: boolean;
   model: ModelRef;
   storage: Storage;
+  pushPublicKey?: string;
   authInfo(): Promise<AuthInfo | undefined>;
   close(): Promise<void>;
 };
@@ -287,6 +303,29 @@ export async function createApiRuntime(
     demo: config.demo,
     model,
     storage,
+    ...(config.vapidPublicKey ? { pushPublicKey: config.vapidPublicKey } : {}),
+    async setPushSubscription(subscription, endpoint) {
+      if (subscription === null) {
+        if (endpoint) {
+          await storage.setSetting(pushSettingKey(endpoint), "");
+        }
+        return;
+      }
+      if (
+        typeof subscription.endpoint !== "string" ||
+        !subscription.endpoint.startsWith("https://") ||
+        typeof subscription.keys?.p256dh !== "string" ||
+        subscription.keys.p256dh === "" ||
+        typeof subscription.keys?.auth !== "string" ||
+        subscription.keys.auth === ""
+      ) {
+        throw new Error("invalid push subscription");
+      }
+      await storage.setSetting(
+        pushSettingKey(subscription.endpoint),
+        JSON.stringify({ ...subscription, createdAt: Date.now() }),
+      );
+    },
     conversation,
     async listConversations(includeArchived = false) {
       return storage.listConversations(includeArchived);

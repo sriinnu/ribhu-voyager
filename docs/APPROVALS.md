@@ -58,6 +58,12 @@ A different command or path always prompts again. Rules are conversation-scoped 
 they inherit tenant/RLS isolation and survive restarts. Rules are add-only today; there is no
 revoke/manage UI.
 
+## Web Push
+
+When `RIBBHU_VAPID_PUBLIC_KEY`/`RIBBHU_VAPID_PRIVATE_KEY` are set, the PWA can enable Web Push.
+The worker notifies every subscribed browser for the tenant when a new approval request is
+journaled. Push requires HTTPS (or localhost); native APNs/FCM is not configured.
+
 ## Durability
 
 The approval is part of the journal, not worker memory. If the worker restarts while a request

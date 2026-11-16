@@ -6,3 +6,30 @@ dist/
 .chrome-profile/
 *.log
 .DS_Store
+
+# Native app build outputs / caches (Capacitor ios + android).
+# The generated projects also ship their own .gitignore; these root entries
+# keep outputs ignored if those projects are ever regenerated.
+apps/mobile/ios/App/build/
+apps/mobile/ios/App/Pods/
+apps/mobile/ios/App/output/
+apps/mobile/ios/App/App/public/
+apps/mobile/ios/App/App/capacitor.config.json
+apps/mobile/ios/App/App/config.xml
+apps/mobile/ios/DerivedData/
+apps/mobile/ios/capacitor-cordova-ios-plugins/
+apps/mobile/android/.gradle/
+apps/mobile/android/build/
+apps/mobile/android/app/build/
+apps/mobile/android/local.properties
+apps/mobile/android/capacitor-cordova-android-plugins/
+apps/mobile/android/app/src/main/assets/public/
+apps/mobile/android/app/src/main/assets/capacitor.config.json
+apps/mobile/android/app/src/main/assets/capacitor.plugins.json
+apps/mobile/android/app/src/main/res/xml/config.xml
+
+# Native packaging artifacts
+*.ipa
+*.aab
+*.apk
+*.xcresult

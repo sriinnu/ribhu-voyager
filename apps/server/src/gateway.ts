@@ -403,6 +403,53 @@ export function attachGateway(
         return;
       }
 
+      case "push": {
+        const runtime = client.runtime;
+        if (!runtime.setPushSubscription) {
+          send(socket, {
+            t: "error",
+            code: "bad_request",
+            message: "Push is not enabled on this server.",
+          });
+          return;
+        }
+        try {
+          if (message.subscription === null) {
+            if (typeof message.endpoint !== "string" || message.endpoint === "") {
+              send(socket, {
+                t: "error",
+                code: "bad_request",
+                message: "endpoint is required to unsubscribe.",
+              });
+              return;
+            }
+            await runtime.setPushSubscription(null, message.endpoint);
+            return;
+          }
+          if (
+            typeof message.subscription !== "object" ||
+            typeof message.subscription.endpoint !== "string" ||
+            typeof message.subscription.keys?.p256dh !== "string" ||
+            typeof message.subscription.keys?.auth !== "string"
+          ) {
+            send(socket, {
+              t: "error",
+              code: "bad_request",
+              message: "Invalid push subscription.",
+            });
+            return;
+          }
+          await runtime.setPushSubscription(message.subscription);
+        } catch (error) {
+          send(socket, {
+            t: "error",
+            code: "bad_request",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
+
       case "approval": {
         if (!client.conversationId) {
           send(socket, {

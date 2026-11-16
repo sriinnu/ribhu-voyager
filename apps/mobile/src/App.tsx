@@ -936,7 +936,11 @@ export function App() {
           </b>
         </div>
 
-        <SettingsPanel gateway={state.gateway} token={state.token} />
+        <SettingsPanel
+          gateway={state.gateway}
+          token={state.token}
+          pushPublicKey={state.info?.pushPublicKey}
+        />
 
         <div className="sheet-actions">
           <button

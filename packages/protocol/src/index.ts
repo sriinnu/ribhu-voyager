@@ -73,6 +73,13 @@ export type ServerInfo = {
   startedAt: number;
   /** Present when the provider is Anthropic. */
   auth?: AuthInfo;
+  /** VAPID public key when server push is enabled. */
+  pushPublicKey?: string;
+};
+
+export type PushSubscription = {
+  endpoint: string;
+  keys: { p256dh: string; auth: string };
 };
 
 /**
@@ -112,6 +119,12 @@ export type ClientMessage =
   | { t: "search"; query: string }
   | { t: "archive"; conversationId: number; archived: boolean }
   | { t: "auth"; mode: AuthMode }
+  | {
+      t: "push";
+      subscription: PushSubscription | null;
+      /** Required when unsubscribing a specific endpoint. */
+      endpoint?: string;
+    }
   | { t: "ping"; ts: number };
 
 export type ServerMessage =
@@ -183,6 +196,7 @@ export function isClientMessage(value: unknown): value is ClientMessage {
     t === "search" ||
     t === "archive" ||
     t === "auth" ||
+    t === "push" ||
     t === "ping"
   );
 }

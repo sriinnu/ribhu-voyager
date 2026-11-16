@@ -28,6 +28,10 @@ export type Config = {
   tenantId?: string;
   /** Hard tool gate, or `ask` for durable per-call approval. */
   approvals?: ApprovalsMode;
+  /** Web Push VAPID keys; both are required to enable server push. */
+  vapidPublicKey?: string;
+  vapidPrivateKey?: string;
+  vapidSubject?: string;
 };
 
 // Resolve against the repository, not the caller's cwd: npm workspace scripts run
@@ -109,6 +113,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
+  const vapidPublicKey = env.RIBBHU_VAPID_PUBLIC_KEY?.trim() || undefined;
+  const vapidPrivateKey = env.RIBBHU_VAPID_PRIVATE_KEY?.trim() || undefined;
+  if (Boolean(vapidPublicKey) !== Boolean(vapidPrivateKey)) {
+    throw new Error(
+      "RIBBHU_VAPID_PUBLIC_KEY and RIBBHU_VAPID_PRIVATE_KEY must be set together.",
+    );
+  }
+
   const sandboxRaw = env.RIBBHU_SANDBOX?.trim().toLowerCase() || "local";
   if (sandboxRaw !== "local" && sandboxRaw !== "docker") {
     throw new Error(
@@ -136,6 +148,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       : {}),
     approvals: approvalsRaw,
     sandbox: sandboxRaw,
+    ...(vapidPublicKey
+      ? {
+          vapidPublicKey,
+          vapidPrivateKey: vapidPrivateKey!,
+          vapidSubject:
+            env.RIBBHU_VAPID_SUBJECT?.trim() || "mailto:hello@srinivas.dev",
+        }
+      : {}),
     sandboxImage: env.RIBBHU_SANDBOX_IMAGE?.trim() || "node:24-bookworm",
     ...(anthropicApiKey ? { anthropicApiKey } : {}),
   };
@@ -149,6 +169,7 @@ export function describeConfig(config: Config): string {
     `  storage   ${config.storage === "postgres" ? `Postgres (tenant ${config.tenantId ?? "default"})` : join(config.dataDir, "ribhu.sqlite")}`,
     `  approvals ${config.approvals ?? "allow"}`,
     `  sandbox   ${config.sandbox ?? "local"}${config.sandbox === "docker" ? ` (${config.sandboxImage ?? "node:24-bookworm"})` : ""}`,
+    `  push      ${config.vapidPublicKey ? "Web Push enabled" : "disabled (set RIBBHU_VAPID_*)"}`,
   ];
   return lines.join("\n");
 }

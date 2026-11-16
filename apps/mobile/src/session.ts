@@ -9,6 +9,7 @@ import type {
 } from "@ribhu-voyager/protocol";
 import { PROTOCOL_VERSION } from "@ribhu-voyager/protocol";
 
+import { subscribeForPush, unsubscribeFromPush } from "./push";
 import {
   isOAuthLink,
   listenForAppUrls,
@@ -507,6 +508,39 @@ export class Session {
     }
     this.send({ t: "approval", conversationId, callId, decision });
     return true;
+  }
+
+  /**
+   * Enable server Web Push for approvals. Requires the gateway to expose a
+   * VAPID public key in `welcome` and a user gesture for permission.
+   */
+  async enablePushNotifications(): Promise<{ ok: boolean; error?: string }> {
+    const publicKey = this.state.info?.pushPublicKey;
+    if (!publicKey) {
+      return { ok: false, error: "Server push is not configured on this gateway." };
+    }
+    if (!this.welcomed || !this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      return { ok: false, error: "Reconnect before enabling push." };
+    }
+    try {
+      const subscription = await subscribeForPush(publicKey);
+      this.send({ t: "push", subscription });
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  async disablePushNotifications(): Promise<void> {
+    try {
+      const endpoint = await unsubscribeFromPush();
+      if (endpoint) this.send({ t: "push", subscription: null, endpoint });
+    } catch {
+      /* best effort */
+    }
   }
 
   resync(): void {

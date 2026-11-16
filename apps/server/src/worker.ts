@@ -20,6 +20,7 @@ import { PiAuthStore, defaultAuthFile } from "./auth-store.js";
 import { ClaudeCodeAuthStore } from "./claude-code-auth.js";
 import type { Config } from "./config.js";
 import { WORKER_STALE_MS } from "./health.js";
+import { createPushNotifier } from "./push.js";
 import { createToolRunner } from "./tools-runtime.js";
 
 const INSTRUCTIONS = [
@@ -99,6 +100,7 @@ export async function startWorker(
     ? { provider: "demo", modelId: "ribhu-demo" }
     : { provider: config.provider, modelId: config.model };
 
+  const push = createPushNotifier(storage, config);
   const engine = await Engine.open({
     storage,
     provider,
@@ -112,6 +114,8 @@ export async function startWorker(
     instructions: INSTRUCTIONS,
     maxWindowEntries: config.maxWindowEntries,
     approvals: config.approvals ?? "allow",
+    onApprovalRequest: (conversationId, request) =>
+      push.notify({ conversationId, ...request }),
     autoRun: false,
     recoverOnOpen: false,
     log: (line) => log(`engine    ${line}`),

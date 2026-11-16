@@ -305,6 +305,19 @@ the list and search, and can be restored from the Archived section.
 
 ![Archived conversations](docs/ribhu-archived.png)
 
+### Web Push
+
+Generate VAPID keys and start the gateway with them:
+
+```bash
+npx web-push generate-vapid-keys
+RIBBHU_VAPID_PUBLIC_KEY=... RIBBHU_VAPID_PRIVATE_KEY=... npm start
+```
+
+The PWA's Session sheet shows **Enable server push**. Push requires HTTPS (or localhost) and browser
+notification permission. Approvals are sent to every subscribed browser for the tenant. This is
+Web Push only; APNs/FCM for the native app is not configured.
+
 ### Approvals
 
 `RIBBHU_APPROVALS=ask` pauses `bash`, `write`, and `edit` for a phone approval; the pending request
@@ -399,6 +412,9 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 | `RIBBHU_APPROVALS` | `allow` | `allow`, `ask`, `deny-bash`, or `read-only` |
 | `RIBBHU_TENANT` | `default` | Postgres tenant for this deployment |
 | `RIBBHU_STRICT_RLS` | unset | `1` fails startup if the Postgres role bypasses RLS |
+| `RIBBHU_VAPID_PUBLIC_KEY` | unset | Web Push VAPID public key |
+| `RIBBHU_VAPID_PRIVATE_KEY` | unset | Web Push VAPID private key |
+| `RIBBHU_VAPID_SUBJECT` | `mailto:hello@srinivas.dev` | VAPID subject |
 | `RIBBHU_STORAGE` | `sqlite` | `sqlite` or `postgres` |
 | `RIBBHU_POSTGRES_URL` | unset | Postgres URL when storage is `postgres` |
 | `RIBBHU_DEMO` | unset | `1` forces the scripted provider |
@@ -411,7 +427,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 ## Tests and development
 
 ```bash
-npm test          # 74 tests
+npm test          # 76 tests
 npm run typecheck
 npm run build
 npm run dev
@@ -497,11 +513,11 @@ next step. See [docs/ARCHITECTURE-UPGRADE.md](docs/ARCHITECTURE-UPGRADE.md) and 
 - **RLS requires the right role.** A superuser or `BYPASSRLS` role silently bypasses row security.
   Provision a dedicated `NOSUPERUSER NOBYPASSRLS` app role.
 - **Approvals are single-user and non-cryptographic.** `ask` pauses risky tools, survives restart, and
-  can remember an exact call, but there is no approver role, rule-management UI, push notification,
-  or signed audit trail.
-- **Native is a foundation.** Configurable gateway, deep-link parsing, local approval notifications,
-  and a token-storage seam exist; no iOS/Android project, OAuth exchange, secure native storage,
-  or server push has been generated.
+  can remember an exact call. Web Push can notify the PWA, but there is no approver role,
+  rule-management UI, signed audit trail, or native APNs/FCM push.
+- **Native is real but not store-ready.** Generated iOS/Android projects build (iOS simulator and
+  Android debug APK verified), with configurable gateway, deep-link parsing, local notifications, and
+  a token-storage seam. No signing, OAuth exchange, secure native storage, or APNs/FCM push yet.
 - **Single SQLite writer.** One gateway/worker pair per data directory. Postgres supports multiple
   workers with leases and fences.
 - **No billing, quotas, usage events, or audit dashboards.** Usage is a per-conversation doc.
