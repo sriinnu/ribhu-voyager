@@ -57,6 +57,24 @@ export async function startWorker(
   options: WorkerOptions = {},
 ): Promise<WorkerHandle> {
   const log = options.log ?? (() => undefined);
+
+  // R6: the tenancy contract is one worker per tenant, not a shared pool. Make
+  // the tenant explicit at startup and validate it even for embedded callers
+  // that construct a Config by hand (loadConfig already validates env input).
+  const workerTenant = config.tenantId ?? "default";
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(workerTenant)) {
+    throw new Error(
+      `RIBBHU_TENANT "${workerTenant}" is invalid; use 1-64 letters, digits, dash, or underscore.`,
+    );
+  }
+  const poolCap = config.maxTenantRuntimes ?? 20;
+  log(
+    `tenant    ${workerTenant}` +
+      (config.storage === "postgres"
+        ? ` (one worker per tenant; API runtime cap ${poolCap === 0 ? "unlimited" : poolCap})`
+        : " (local data dir; one worker owns it)"),
+  );
+
   await mkdir(config.dataDir, { recursive: true });
   await mkdir(config.workspaceDir, { recursive: true });
 

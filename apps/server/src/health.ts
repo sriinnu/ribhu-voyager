@@ -1,6 +1,11 @@
 import { PROTOCOL_VERSION } from "@ribhu-voyager/protocol";
 
 import type { ApiRuntime } from "./api-runtime.js";
+import {
+  isCapacityExceeded,
+  type RuntimePool,
+  type RuntimeResolveResult,
+} from "./runtime-pool.js";
 
 /** A worker heartbeat older than this is reported as not alive. */
 export const WORKER_STALE_MS = 15_000;
@@ -28,6 +33,57 @@ function parseJob(raw: string | undefined): WorkerJob | null {
   } catch {
     return null;
   }
+}
+
+export type HealthResponse = {
+  status: number;
+  payload: Record<string, unknown>;
+};
+
+/**
+ * R6: resolve a health caller through the bounded tenant pool.
+ *
+ * - Exhausted pool capacity for a *new* tenant → 503 with a clear message.
+ * - Unknown/missing token → 200 minimal payload (unchanged public behavior).
+ * - Authenticated tenant → 200 detailed payload including pool stats.
+ */
+export async function healthResponse(
+  pool: Pick<RuntimePool, "resolve" | "stats">,
+  token: string | undefined,
+  startedAt: number,
+): Promise<HealthResponse> {
+  const resolved: RuntimeResolveResult = await pool.resolve(token);
+  if (isCapacityExceeded(resolved)) {
+    return {
+      status: 503,
+      payload: {
+        ok: false,
+        error: "capacity_exceeded",
+        message: resolved.message,
+        pool: {
+          activeTenants: resolved.activeTenants,
+          maxTenants: resolved.limit,
+        },
+      },
+    };
+  }
+  if (!resolved) {
+    return {
+      status: 200,
+      payload: {
+        ok: true,
+        protocol: PROTOCOL_VERSION,
+        uptimeMs: Date.now() - startedAt,
+      },
+    };
+  }
+  return {
+    status: 200,
+    payload: {
+      ...(await healthPayload(resolved.runtime, true)),
+      pool: pool.stats(),
+    },
+  };
 }
 
 export async function healthPayload(

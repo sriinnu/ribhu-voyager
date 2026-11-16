@@ -3,7 +3,6 @@ import { networkInterfaces } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 
-import { PROTOCOL_VERSION } from "@ribhu-voyager/protocol";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { describeConfig, loadConfig } from "./config.js";
@@ -17,8 +16,8 @@ import { Db } from "@ribhu-voyager/storage-sqlite";
 
 import type { ApiRuntime } from "./api-runtime.js";
 import { createAdminApi } from "./admin.js";
-import { healthPayload } from "./health.js";
-import { createRuntimePool } from "./runtime-pool.js";
+import { healthResponse } from "./health.js";
+import { createRuntimePool, runtimeForGateway } from "./runtime-pool.js";
 import { createStaticHandler } from "./static.js";
 
 const color = {
@@ -184,20 +183,14 @@ const server = createServer((request, response) => {
         }
       }
       // Authenticated callers get their tenant's detailed health; unknown or
-      // missing tokens get only the minimal public payload.
-      const resolved = await pool.resolve(healthToken);
-      const payload = resolved
-        ? await healthPayload(resolved.runtime, true)
-        : {
-            ok: true,
-            protocol: PROTOCOL_VERSION,
-            uptimeMs: Date.now() - startedAt,
-          };
-      response.writeHead(200, {
+      // missing tokens get only the minimal public payload. Pool exhaustion for
+      // a new tenant is a clear 503 (existing tenants keep working).
+      const health = await healthResponse(pool, healthToken, startedAt);
+      response.writeHead(health.status, {
         "content-type": "application/json; charset=utf-8",
         "cache-control": "no-store",
       });
-      response.end(JSON.stringify(payload));
+      response.end(JSON.stringify(health.payload));
       return;
     }
 
@@ -242,7 +235,7 @@ const gateway = attachGateway(
     max: Math.max(config.maxWindowEntries, 50),
   },
   {
-    resolveRuntime: async (token) => (await pool.resolve(token))?.runtime,
+    resolveRuntime: async (token) => runtimeForGateway(await pool.resolve(token)),
     infoFor: (runtime) => pool.infoFor(runtime as ApiRuntime),
     allowAnonymous: config.allowAnon === true,
     allowedOrigins: config.allowedOrigins ?? [],

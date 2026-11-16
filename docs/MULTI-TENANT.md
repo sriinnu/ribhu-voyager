@@ -45,6 +45,23 @@ curl -H "Authorization: Bearer $TENANT_TOKEN" https://gateway.example.com/api/he
 Authenticated health is scoped to that token's tenant: worker snapshots, queue, auth state.
 Unauthenticated health returns only `{ok, protocol, uptimeMs}`.
 
+## Capacity
+
+The API process caches one runtime per tenant (storage pool, engine handles, auth state), so the
+cache is bounded:
+
+- `RIBBHU_MAX_TENANT_RUNTIMES` (default `20`, `0` = unlimited) caps the number of tenant runtimes a
+  single API process will create.
+- A token for a *new* tenant past the cap is refused with HTTP **503** (`capacity_exceeded`) on both
+  the WebSocket upgrade and `/api/health`; already-resolved tenants keep working, and their clients
+  are unaffected.
+- Authenticated health includes `pool: {activeTenants, pendingTenants, maxTenants, unlimited,
+  tenants}`; startup prints the configured cap.
+
+This is the deliberate safe design: bounded resources with an explicit failure mode, not a
+rewrite. The residual limitation is that tenant count per API process is capped (raise the env or run
+more API processes); nothing multiplexes tenants inside one runtime.
+
 ## Isolation guarantees
 
 - A tenant token cannot resync, fork, rename, archive, submit to, or abort another tenant's
@@ -58,4 +75,8 @@ Unauthenticated health returns only `{ok, protocol, uptimeMs}`.
 - No tenant provisioning/admin API, per-tenant quotas, billing, or audit dashboard.
 - Workers are deployed per tenant; no shared worker pool.
 - No token rotation UI beyond the CLI (`issue` / `revoke`).
-- The API process holds one runtime per active tenant; capacity planning is per process.
+- The API process holds one runtime per active tenant up to `RIBBHU_MAX_TENANT_RUNTIMES`; capacity
+  planning is per process.
+- **Residual limitation (R6):** true per-request shared-pool tenancy is not implemented. Each
+  tenant still gets its own runtime/storage pool (and its own worker); the cap only bounds the number
+  of cached runtimes. Plan one worker per tenant; this is not a shared worker pool or autoscaler.

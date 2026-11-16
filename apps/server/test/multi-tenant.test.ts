@@ -18,9 +18,21 @@ import {
   type ApiRuntime,
   type GatewayRuntime,
 } from "../src/api-runtime.js";
-import type { Config } from "../src/config.js";
+import { loadConfig, type Config } from "../src/config.js";
 import { attachGateway, type Gateway } from "../src/gateway.js";
-import { createRuntimePool, runtimeInfo } from "../src/runtime-pool.js";
+import { healthResponse } from "../src/health.js";
+import { startWorker } from "../src/worker.js";
+import {
+  createRuntimePool,
+  isCapacityExceeded,
+  runtimeForGateway,
+  runtimeInfo,
+  type ApiRuntimeFactory,
+  type ResolvedRuntime,
+  type RuntimeCapacityExceeded,
+  type RuntimePool,
+  type RuntimeResolveResult,
+} from "../src/runtime-pool.js";
 
 function configFor(dataDir: string, token = ""): Config {
   return {
@@ -39,6 +51,44 @@ function configFor(dataDir: string, token = ""): Config {
   };
 }
 
+function expectResolved(value: RuntimeResolveResult): ResolvedRuntime {
+  assert.ok(value, "expected the pool to resolve a tenant runtime");
+  if (isCapacityExceeded(value)) {
+    throw new Error(`unexpected capacity refusal: ${value.message}`);
+  }
+  return value;
+}
+
+function expectCapacity(value: RuntimeResolveResult): RuntimeCapacityExceeded {
+  assert.ok(value, "expected a capacity refusal");
+  if (!isCapacityExceeded(value)) {
+    throw new Error("expected the pool to report capacity_exceeded");
+  }
+  return value;
+}
+
+/** Pool over isolated SQLite dirs; token `token-<tenant>` selects the tenant. */
+function createPoolFor(
+  baseDir: string,
+  tenantDirs: Map<string, string>,
+  maxTenantRuntimes?: number,
+): RuntimePool {
+  const factory: ApiRuntimeFactory = async (tenantConfig, tenantId) => {
+    const dir = tenantDirs.get(tenantId);
+    if (!dir) throw new Error(`no data dir for tenant ${tenantId}`);
+    return createApiRuntime(
+      { ...tenantConfig, dataDir: dir, workspaceDir: join(dir, "workspace") },
+      tenantId,
+    );
+  };
+  return createRuntimePool(
+    { ...configFor(baseDir), maxTenantRuntimes } as Config,
+    async (token) =>
+      token.startsWith("token-") ? token.slice("token-".length) : undefined,
+    factory,
+  );
+}
+
 type Waiter = {
   match: (message: ServerMessage) => boolean;
   resolve: (message: ServerMessage) => void;
@@ -54,6 +104,7 @@ class TestClient {
   constructor(port: number, token?: string) {
     const query = token ? `?token=${encodeURIComponent(token)}` : "";
     this.ws = new WebSocket(`ws://127.0.0.1:${port}/ws${query}`);
+    this.ws.on("error", () => undefined);
     this.ws.on("message", (raw) => {
       const message = JSON.parse(raw.toString()) as ServerMessage;
       const index = this.waiters.findIndex((waiter) => waiter.match(message));
@@ -292,8 +343,7 @@ test("runtime pool creates one runtime per tenant and enforces tokens", { timeou
     },
   );
   try {
-    const a = await pool.resolve("token-a");
-    assert.ok(a);
+    const a = expectResolved(await pool.resolve("token-a"));
     assert.equal(a.tenantId, "tenant-a");
     assert.equal(a.info.serverId, a.runtime.serverId);
     assert.equal(a.info.provider, "demo");
@@ -302,8 +352,7 @@ test("runtime pool creates one runtime per tenant and enforces tokens", { timeou
     assert.equal(await pool.resolve("token-a"), a);
     assert.equal(pool.infoFor(a.runtime), a.info);
 
-    const b = await pool.resolve("token-b");
-    assert.ok(b);
+    const b = expectResolved(await pool.resolve("token-b"));
     assert.equal(b.tenantId, "tenant-b");
     assert.notEqual(b.runtime.serverId, a.runtime.serverId);
 
@@ -322,14 +371,221 @@ test("shared token guards the default single runtime", { timeout: 20_000 }, asyn
   const dir = await mkdtemp(join(tmpdir(), "ribhu-pool-shared-"));
   const pool = createRuntimePool(configFor(dir, "shared"));
   try {
-    const resolved = await pool.resolve("shared");
-    assert.ok(resolved);
+    const resolved = expectResolved(await pool.resolve("shared"));
     assert.equal(resolved.tenantId, "default");
-    assert.equal(resolved.runtime.serverId, (await pool.resolve("shared"))!.runtime.serverId);
+    assert.equal(
+      resolved.runtime.serverId,
+      expectResolved(await pool.resolve("shared")).runtime.serverId,
+    );
     assert.equal(await pool.resolve("wrong"), undefined);
     assert.equal(await pool.resolve(undefined), undefined);
   } finally {
     await pool.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("R6: RIBBHU_MAX_TENANT_RUNTIMES defaults to 20 and accepts 0", () => {
+  assert.equal(loadConfig({}).maxTenantRuntimes, 20);
+  assert.equal(
+    loadConfig({ RIBBHU_MAX_TENANT_RUNTIMES: "5" }).maxTenantRuntimes,
+    5,
+  );
+  assert.equal(
+    loadConfig({ RIBBHU_MAX_TENANT_RUNTIMES: "0" }).maxTenantRuntimes,
+    0,
+  );
+  assert.throws(
+    () => loadConfig({ RIBBHU_MAX_TENANT_RUNTIMES: "-1" }),
+    /RIBBHU_MAX_TENANT_RUNTIMES must be a non-negative integer/,
+  );
+  assert.throws(
+    () => loadConfig({ RIBBHU_MAX_TENANT_RUNTIMES: "1.5" }),
+    /RIBBHU_MAX_TENANT_RUNTIMES must be a non-negative integer/,
+  );
+});
+
+test("R6: pool caps new tenants but keeps serving existing ones", { timeout: 20_000 }, async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "ribhu-pool-cap-"));
+  const dirs = new Map<string, string>([
+    ["tenant-a", await mkdtemp(join(tmpdir(), "ribhu-pool-cap-a-"))],
+    ["tenant-b", await mkdtemp(join(tmpdir(), "ribhu-pool-cap-b-"))],
+    ["tenant-c", await mkdtemp(join(tmpdir(), "ribhu-pool-cap-c-"))],
+  ]);
+  const pool = createPoolFor(baseDir, dirs, 2);
+  try {
+    const a = expectResolved(await pool.resolve("token-tenant-a"));
+    const b = expectResolved(await pool.resolve("token-tenant-b"));
+
+    const refused = expectCapacity(await pool.resolve("token-tenant-c"));
+    assert.equal(refused.error, "capacity_exceeded");
+    assert.equal(refused.tenantId, "tenant-c");
+    assert.equal(refused.activeTenants, 2);
+    assert.equal(refused.limit, 2);
+    assert.match(refused.message, /capacity reached/i);
+
+    // Existing tenants are never evicted or re-created by the cap.
+    assert.equal(expectResolved(await pool.resolve("token-tenant-a")), a);
+    assert.equal(expectResolved(await pool.resolve("token-tenant-b")), b);
+
+    assert.deepEqual(pool.stats(), {
+      activeTenants: 2,
+      pendingTenants: 0,
+      maxTenants: 2,
+      unlimited: false,
+      tenants: ["tenant-a", "tenant-b"],
+    });
+
+    // An unknown token is still a normal rejection, not a capacity error.
+    assert.equal(await pool.resolve("bogus"), undefined);
+  } finally {
+    await pool.close();
+    await Promise.all(
+      [...dirs.values()].map((dir) => rm(dir, { recursive: true, force: true })),
+    );
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test("R6: maxTenantRuntimes=0 means unlimited", { timeout: 20_000 }, async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "ribhu-pool-unlimited-"));
+  const dirs = new Map<string, string>([
+    ["tenant-a", await mkdtemp(join(tmpdir(), "ribhu-pool-uncapped-a-"))],
+    ["tenant-b", await mkdtemp(join(tmpdir(), "ribhu-pool-uncapped-b-"))],
+    ["tenant-c", await mkdtemp(join(tmpdir(), "ribhu-pool-uncapped-c-"))],
+  ]);
+  const pool = createPoolFor(baseDir, dirs, 0);
+  try {
+    expectResolved(await pool.resolve("token-tenant-a"));
+    expectResolved(await pool.resolve("token-tenant-b"));
+    expectResolved(await pool.resolve("token-tenant-c"));
+    assert.deepEqual(pool.stats(), {
+      activeTenants: 3,
+      pendingTenants: 0,
+      maxTenants: 0,
+      unlimited: true,
+      tenants: ["tenant-a", "tenant-b", "tenant-c"],
+    });
+  } finally {
+    await pool.close();
+    await Promise.all(
+      [...dirs.values()].map((dir) => rm(dir, { recursive: true, force: true })),
+    );
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test("R6: health returns 503 with pool stats when capacity is exhausted", { timeout: 20_000 }, async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "ribhu-pool-health-"));
+  const dirs = new Map<string, string>([
+    ["tenant-a", await mkdtemp(join(tmpdir(), "ribhu-pool-health-a-"))],
+    ["tenant-b", await mkdtemp(join(tmpdir(), "ribhu-pool-health-b-"))],
+  ]);
+  const pool = createPoolFor(baseDir, dirs, 1);
+  try {
+    expectResolved(await pool.resolve("token-tenant-a"));
+
+    const refused = await healthResponse(pool, "token-tenant-b", Date.now());
+    assert.equal(refused.status, 503);
+    assert.equal(refused.payload.ok, false);
+    assert.equal(refused.payload.error, "capacity_exceeded");
+    assert.match(String(refused.payload.message), /capacity reached/i);
+    assert.deepEqual(refused.payload.pool, {
+      activeTenants: 1,
+      maxTenants: 1,
+    });
+
+    const healthy = await healthResponse(pool, "token-tenant-a", Date.now());
+    assert.equal(healthy.status, 200);
+    assert.equal(healthy.payload.ok, true);
+    assert.ok(healthy.payload.worker, "authenticated health is detailed");
+    assert.deepEqual(healthy.payload.pool, {
+      activeTenants: 1,
+      pendingTenants: 0,
+      maxTenants: 1,
+      unlimited: false,
+      tenants: ["tenant-a"],
+    });
+
+    const anonymous = await healthResponse(pool, "unknown", Date.now());
+    assert.equal(anonymous.status, 200);
+    assert.equal(anonymous.payload.pool, undefined);
+  } finally {
+    await pool.close();
+    await Promise.all(
+      [...dirs.values()].map((dir) => rm(dir, { recursive: true, force: true })),
+    );
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test("R6: WS upgrade returns 503 when a new tenant exceeds capacity", { timeout: 30_000 }, async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "ribhu-pool-upgrade-"));
+  const dirs = new Map<string, string>([
+    ["tenant-a", await mkdtemp(join(tmpdir(), "ribhu-pool-upgrade-a-"))],
+    ["tenant-b", await mkdtemp(join(tmpdir(), "ribhu-pool-upgrade-b-"))],
+  ]);
+  const pool = createPoolFor(baseDir, dirs, 1);
+  const { port, gateway, server } = await startGateway(async (token) =>
+    runtimeForGateway(await pool.resolve(token)),
+  );
+  const clientA = new TestClient(port, "token-tenant-a");
+  let clientB: TestClient | undefined;
+  let again: TestClient | undefined;
+  try {
+    await clientA.open();
+    clientA.send({ t: "hello", v: PROTOCOL_VERSION, clientId: "tenant-a" });
+    const welcome = welcomeOf(
+      await clientA.next((message) => message.t === "welcome"),
+    );
+    assert.equal(welcome.info.serverId, expectResolved(await pool.resolve("token-tenant-a")).runtime.serverId);
+
+    // A second tenant is refused at the upgrade boundary (503), not 401.
+    clientB = new TestClient(port, "token-tenant-b");
+    await assert.rejects(
+      clientB.open(),
+      /503|Unexpected server response/,
+    );
+
+    // The already-active tenant can still connect/reconnect.
+    again = new TestClient(port, "token-tenant-a");
+    await again.open();
+  } finally {
+    clientA.close();
+    clientB?.close();
+    again?.close();
+    await gateway.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await pool.close();
+    await Promise.all(
+      [...dirs.values()].map((dir) => rm(dir, { recursive: true, force: true })),
+    );
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test("R6: worker validates and logs its single tenant", { timeout: 20_000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ribhu-worker-tenant-"));
+  try {
+    await assert.rejects(
+      startWorker({ ...configFor(dir), tenantId: "bad tenant!" }),
+      /RIBBHU_TENANT .* is invalid/,
+    );
+
+    const lines: string[] = [];
+    const worker = await startWorker(
+      { ...configFor(dir), tenantId: "tenant-a", maxTenantRuntimes: 7 },
+      { log: (line) => lines.push(line) },
+    );
+    try {
+      assert.ok(
+        lines.some((line) => /tenant\s+tenant-a/.test(line)),
+        "worker logs its tenant",
+      );
+    } finally {
+      await worker.close();
+    }
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });

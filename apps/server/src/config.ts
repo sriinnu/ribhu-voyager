@@ -60,6 +60,12 @@ export type Config = {
   rateLimitPerMinute?: number;
   /** R8: optional allowlist of push endpoint hosts (suffix match with `*.`). */
   pushAllowedHosts?: string[];
+  /**
+   * R6: max per-tenant API runtimes cached in this process. 0 = unlimited.
+   * The pool refuses new tenants past this cap (HTTP 503) instead of growing
+   * without bound; existing tenants keep working.
+   */
+  maxTenantRuntimes?: number;
   /** True when startup generated a token instead of reading RIBBHU_TOKEN. */
   tokenGenerated?: boolean;
 };
@@ -165,6 +171,14 @@ function parseRateLimit(env: NodeJS.ProcessEnv): number {
     );
   }
   return value;
+}
+
+function parseMaxTenantRuntimes(env: NodeJS.ProcessEnv): number {
+  return parseNonNegativeInt(
+    env.RIBBHU_MAX_TENANT_RUNTIMES?.trim(),
+    "RIBBHU_MAX_TENANT_RUNTIMES",
+    20,
+  );
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -336,6 +350,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   );
 
   const rateLimitPerMinute = parseRateLimit(env);
+  const maxTenantRuntimes = parseMaxTenantRuntimes(env);
 
   return {
     host,
@@ -355,6 +370,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     strictRls,
     rateLimitPerMinute,
     pushAllowedHosts,
+    maxTenantRuntimes,
     authMode,
     authSource,
     storage: storageRaw,
@@ -402,6 +418,7 @@ export function describeConfig(config: Config): string {
     }`,
     `  origins   ${config.allowedOrigins?.length ? config.allowedOrigins.join(", ") : "same-origin only"}`,
     `  rate      ${config.rateLimitPerMinute ? `${config.rateLimitPerMinute}/min per IP or token` : "disabled"}`,
+    `  tenants   ${config.maxTenantRuntimes && config.maxTenantRuntimes > 0 ? `cap ${config.maxTenantRuntimes} API runtimes (one worker per tenant)` : "API runtime cap unlimited (RIBBHU_MAX_TENANT_RUNTIMES=0)"}`,
     `  posture   ${config.allowUnsafeHosted ? "break-glass (RIBBHU_ALLOW_UNSAFE_HOSTED=1)" : "hardened"}${config.strictRls ? " · strict RLS" : ""}`,
     `  push      ${config.vapidPublicKey ? "Web Push enabled" : "disabled (set RIBBHU_VAPID_*)"}`,
     `  admin     ${config.adminToken ? "enabled at /admin" : "disabled (set RIBBHU_ADMIN_TOKEN)"}`,

@@ -410,7 +410,8 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 | `RIBBHU_SANDBOX` | `local` | `local` or `docker` for tool execution |
 | `RIBBHU_SANDBOX_IMAGE` | `node:24-bookworm` | Image used when `RIBBHU_SANDBOX=docker` |
 | `RIBBHU_APPROVALS` | `allow` | `allow`, `ask`, `deny-bash`, or `read-only` |
-| `RIBBHU_TENANT` | `default` | Postgres tenant for this deployment |
+| `RIBBHU_TENANT` | `default` | Postgres tenant for this deployment (one worker per tenant) |
+| `RIBBHU_MAX_TENANT_RUNTIMES` | `20` | Max per-tenant runtimes cached by the API process; `0` = unlimited |
 | `RIBBHU_STRICT_RLS` | unset | `1` fails startup if the Postgres role bypasses RLS |
 | `RIBBHU_VAPID_PUBLIC_KEY` | unset | Web Push VAPID public key |
 | `RIBBHU_VAPID_PRIVATE_KEY` | unset | Web Push VAPID private key |
@@ -429,7 +430,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 ## Tests and development
 
 ```bash
-npm test          # 124 tests
+npm test          # 130 tests
 npm run typecheck
 npm run build
 npm run dev
@@ -510,8 +511,10 @@ next step. See [docs/ARCHITECTURE-UPGRADE.md](docs/ARCHITECTURE-UPGRADE.md) and 
 - **Sandboxing is opt-in.** `RIBBHU_SANDBOX=local` is the default; local `bash` runs as your user
   (with a secret-scrubbed environment). Use `RIBBHU_SANDBOX=docker` for isolation.
 - **Multi-tenant API, one worker per tenant.** One API process routes tenant tokens to isolated
-  runtimes; workers still bind to `RIBBHU_TENANT`, and there is no worker autoscaler or shared worker
-  pool. See [docs/MULTI-TENANT.md](docs/MULTI-TENANT.md).
+  runtimes, capped at `RIBBHU_MAX_TENANT_RUNTIMES` (default 20; new tenants past the cap get HTTP
+  503, existing tenants keep working). Workers still bind to `RIBBHU_TENANT`, and there is no worker
+  autoscaler or shared worker pool; per-request shared-pool tenancy is not implemented. See
+  [docs/MULTI-TENANT.md](docs/MULTI-TENANT.md).
 - **RLS requires the right role.** A superuser or `BYPASSRLS` role silently bypasses row security.
   Provision a dedicated `NOSUPERUSER NOBYPASSRLS` app role.
 - **Approvals are single-user and non-cryptographic.** `ask` pauses risky tools, survives restart, and

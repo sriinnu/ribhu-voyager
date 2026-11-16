@@ -28,6 +28,54 @@ export type ResolvedRuntime = {
   info: ServerInfo;
 };
 
+/** R6 capacity refusal: a *new* tenant would exceed the per-process cap. */
+export type RuntimeCapacityExceeded = {
+  error: "capacity_exceeded";
+  message: string;
+  tenantId: string;
+  /** Runtimes already cached (does not include in-flight creations). */
+  activeTenants: number;
+  /** Configured cap; 0 means unlimited and never produces this error. */
+  limit: number;
+};
+
+export type RuntimeResolveResult =
+  | ResolvedRuntime
+  | RuntimeCapacityExceeded
+  | undefined;
+
+export type PoolStats = {
+  activeTenants: number;
+  pendingTenants: number;
+  /** Configured cap; 0 means unlimited. */
+  maxTenants: number;
+  unlimited: boolean;
+  tenants: string[];
+};
+
+export function isCapacityExceeded(
+  value: RuntimeResolveResult,
+): value is RuntimeCapacityExceeded {
+  return (
+    value !== undefined &&
+    "error" in value &&
+    value.error === "capacity_exceeded"
+  );
+}
+
+/**
+ * Adapter for the WS upgrade path: a rejected token stays `undefined` (401),
+ * while an exhausted pool throws so the upgrade handler answers 503 instead of
+ * silently creating an unbounded runtime.
+ */
+export function runtimeForGateway(
+  result: RuntimeResolveResult,
+): ApiRuntime | undefined {
+  if (result === undefined) return undefined;
+  if (isCapacityExceeded(result)) throw new Error(result.message);
+  return result.runtime;
+}
+
 export type RuntimePool = {
   /**
    * Resolve a client token to its tenant's runtime, creating and caching the
@@ -35,8 +83,13 @@ export type RuntimePool = {
    *
    * With no tenant resolver (SQLite/local) every allowed token maps to the
    * default runtime; the shared `RIBBHU_TOKEN` is enforced for that path only.
+   *
+   * A new tenant past `RIBBHU_MAX_TENANT_RUNTIMES` resolves to a typed
+   * `RuntimeCapacityExceeded`; already-resolved tenants keep working.
    */
-  resolve(token?: string): Promise<ResolvedRuntime | undefined>;
+  resolve(token?: string): Promise<RuntimeResolveResult>;
+  /** Active/pending tenant runtimes and the configured cap (health/debug). */
+  stats(): PoolStats;
   /** ServerInfo for a runtime created by this pool (falls back to its fields). */
   infoFor(runtime: ApiRuntime): ServerInfo;
   /** Close every cached runtime. */
@@ -76,7 +129,30 @@ class RuntimePoolImpl implements RuntimePool {
       createApiRuntime(config, tenantId),
   ) {}
 
-  async resolve(token?: string): Promise<ResolvedRuntime | undefined> {
+  /** Resolved cap; `0` means unlimited. */
+  private capacity(): number {
+    return this.config.maxTenantRuntimes ?? 20;
+  }
+
+  private hasCapacity(): boolean {
+    const limit = this.capacity();
+    return limit === 0 || this.entries.size + this.pending.size < limit;
+  }
+
+  private capacityExceeded(tenantId: string): RuntimeCapacityExceeded {
+    const limit = this.capacity();
+    return {
+      error: "capacity_exceeded",
+      tenantId,
+      activeTenants: this.entries.size,
+      limit,
+      message:
+        `Tenant runtime capacity reached (${this.entries.size + this.pending.size}/${limit}). ` +
+        "Try again later or raise RIBBHU_MAX_TENANT_RUNTIMES (0 = unlimited).",
+    };
+  }
+
+  async resolve(token?: string): Promise<RuntimeResolveResult> {
     let tenantId: string;
     if (this.resolveTenant) {
       if (!token) return undefined;
@@ -91,10 +167,14 @@ class RuntimePoolImpl implements RuntimePool {
       tenantId = this.config.tenantId ?? DEFAULT_TENANT;
     }
 
+    // Existing (and in-flight) tenants always resolve; the cap only gates new
+    // tenants. The check + pending.set below are synchronous, so concurrent
+    // resolutions cannot overshoot the cap.
     const existing = this.entries.get(tenantId);
     if (existing) return existing;
     const inflight = this.pending.get(tenantId);
     if (inflight) return inflight;
+    if (!this.hasCapacity()) return this.capacityExceeded(tenantId);
 
     const created = this.create(tenantId);
     this.pending.set(tenantId, created);
@@ -103,6 +183,17 @@ class RuntimePoolImpl implements RuntimePool {
     } finally {
       this.pending.delete(tenantId);
     }
+  }
+
+  stats(): PoolStats {
+    const maxTenants = this.capacity();
+    return {
+      activeTenants: this.entries.size,
+      pendingTenants: this.pending.size,
+      maxTenants,
+      unlimited: maxTenants === 0,
+      tenants: [...this.entries.keys()].sort(),
+    };
   }
 
   infoFor(runtime: ApiRuntime): ServerInfo {
