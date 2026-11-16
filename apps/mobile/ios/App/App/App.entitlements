@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Push capability. "development" is for development/TestFlight builds; App
+	  Store distribution must use "production" and requires an Apple
+	  Distribution certificate + App Store provisioning profile (not present).
+	-->
+	<key>aps-environment</key>
+	<string>development</string>
+</dict>
+</plist>

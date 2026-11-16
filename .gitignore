@@ -33,3 +33,19 @@ apps/mobile/android/app/src/main/res/xml/config.xml
 *.aab
 *.apk
 *.xcresult
+*.xcarchive
+
+# Native signing material and push credentials — NEVER commit these.
+.secrets/
+apps/mobile/android/keystore.properties
+apps/mobile/android/app/google-services.json
+apps/mobile/ios/App/GoogleService-Info.plist
+apps/mobile/ios/build/
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.cer
+*.jks
+*.keystore
+*.p8
+*.authkey

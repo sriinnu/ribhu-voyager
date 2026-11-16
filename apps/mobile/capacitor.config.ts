@@ -19,21 +19,31 @@
  *   (iOS) and an intent-filter in AndroidManifest.xml, plus the `@capacitor/app`
  *   plugin so `appUrlOpen` fires. None of that is wired yet.
  *
- * ## Generated but NOT signed or store-ready
+ * ## Signing and push status
  *
- * - iOS builds only for the simulator so far. The `App` target has no
- *   DEVELOPMENT_TEAM, provisioning profile, or App Store Connect setup; a
- *   device/archive build and TestFlight are still to do.
- * - Android builds a debug APK. There is no release keystore, no signed AAB,
- *   and no Play Console listing. `android/local.properties` (SDK path) is
- *   machine-local and gitignored.
+ * - Android: release `assembleRelease`/`bundleRelease` build a signed APK/AAB
+ *   when the gitignored `apps/mobile/android/keystore.properties` (and its
+ *   repo-root `.secrets/` keystore) exist; without them they build an unsigned
+ *   artifact. That keystore is a local development key, not a Play credential,
+ *   and is never committed.
+ * - iOS: Release simulator builds are verified with signing disabled. Device /
+ *   archive / TestFlight / App Store signing is blocked because this machine
+ *   has no Xcode Apple ID account, no iOS App Development provisioning profile
+ *   for `dev.ribhu.voyager`, and no Apple Distribution certificate. The App
+ *   target is wired for team `RSH5FK4MB6` with automatic signing and
+ *   `App/App.entitlements`.
+ * - Push: `@capacitor/push-notifications` is installed/synced. iOS carries an
+ *   `aps-environment` (development) entitlement plus the
+ *   `remote-notification` background mode; Android gets the plugin manifest
+ *   permissions and applies `google-services` only when
+ *   `android/app/google-services.json` exists. No APNs/FCM credentials are
+ *   committed, so native push cannot deliver end-to-end yet.
  * - No `server.url` override: the gateway is a persisted runtime setting
  *   (Session → Gateway), not baked into the native config.
- * - No OAuth token exchange endpoint; no APNs/FCM push configuration or
- *   entitlements.
+ * - No OAuth token exchange endpoint; no APNs/FCM provider on the backend.
  *
  * See docs/NATIVE-SHELL.md for the generated-vs-store-ready matrix and the
- * exact build commands/results.
+ * exact build/signing commands, hashes, and blockers.
  */
 const config = {
   appId: "dev.ribhu.voyager",
