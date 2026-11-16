@@ -16,7 +16,7 @@
     "@ribhu-voyager/storage-postgres": "*",
     "@ribhu-voyager/storage-sqlite": "*",
     "web-push": "^4.0.0",
-    "ws": "^8.18.3"
+    "ws": "^8.23.0"
   },
   "devDependencies": {
     "@types/web-push": "^3.6.4",
