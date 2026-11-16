@@ -75,6 +75,11 @@ export type GatewayRuntime = {
     subscription: PushSubscription | null,
     endpoint?: string,
   ): Promise<void>;
+  /** Register an APNs/FCM device token for this tenant/runtime. */
+  setPushDevice?(
+    token: string,
+    platform: "ios" | "android",
+  ): Promise<void>;
   authInfo?(): Awaitable<AuthInfo | undefined>;
   listConversations?(
     includeArchived?: boolean,
@@ -329,6 +334,20 @@ export async function createApiRuntime(
     model,
     storage,
     ...(config.vapidPublicKey ? { pushPublicKey: config.vapidPublicKey } : {}),
+    async setPushDevice(token, platform) {
+      if (
+        typeof token !== "string" ||
+        token.length < 16 ||
+        (platform !== "ios" && platform !== "android")
+      ) {
+        throw new Error("invalid device token");
+      }
+      const key = `device:${createHash("sha256").update(token).digest("hex")}`;
+      await storage.setSetting(
+        key,
+        JSON.stringify({ token, platform, createdAt: Date.now() }),
+      );
+    },
     async setPushSubscription(subscription, endpoint) {
       if (subscription === null) {
         if (endpoint) {

@@ -125,6 +125,7 @@ export type ClientMessage =
       /** Required when unsubscribing a specific endpoint. */
       endpoint?: string;
     }
+  | { t: "push-device"; token: string; platform: "ios" | "android" }
   | { t: "ping"; ts: number };
 
 export type ServerMessage =
@@ -197,6 +198,7 @@ export function isClientMessage(value: unknown): value is ClientMessage {
     t === "archive" ||
     t === "auth" ||
     t === "push" ||
+    t === "push-device" ||
     t === "ping"
   );
 }

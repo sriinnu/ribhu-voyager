@@ -403,6 +403,40 @@ export function attachGateway(
         return;
       }
 
+      case "push-device": {
+        const runtime = client.runtime;
+        if (!runtime.setPushDevice) {
+          send(socket, {
+            t: "error",
+            code: "bad_request",
+            message: "Native push is not enabled on this server.",
+          });
+          return;
+        }
+        if (
+          typeof message.token !== "string" ||
+          message.token.length < 16 ||
+          (message.platform !== "ios" && message.platform !== "android")
+        ) {
+          send(socket, {
+            t: "error",
+            code: "bad_request",
+            message: "Invalid device token or platform.",
+          });
+          return;
+        }
+        try {
+          await runtime.setPushDevice(message.token, message.platform);
+        } catch (error) {
+          send(socket, {
+            t: "error",
+            code: "bad_request",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
+
       case "push": {
         const runtime = client.runtime;
         if (!runtime.setPushSubscription) {

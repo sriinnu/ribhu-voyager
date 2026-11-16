@@ -46,6 +46,10 @@ test("push protocol accepts a subscription and unsubscribe", () => {
     isClientMessage({ t: "push", subscription: null, endpoint: "https://push.example/abc" }),
     true,
   );
+  assert.equal(
+    isClientMessage({ t: "push-device", token: "a".repeat(32), platform: "ios" }),
+    true,
+  );
 });
 
 test("push notifier sends to stored subscriptions and drops gone endpoints", { timeout: 20_000 }, async () => {
@@ -57,6 +61,11 @@ test("push notifier sends to stored subscriptions and drops gone endpoints", { t
       endpoint: "https://push.example/one",
       keys: { p256dh: "p256dh", auth: "auth" },
     });
+    await api.setPushDevice?.("a".repeat(64), "ios");
+    const devices = await api.storage.settingsMatching("device:");
+    assert.equal(devices.length, 1);
+    assert.match(devices[0]!.value, /"platform":"ios"/);
+
     const sent: Array<{ endpoint: string; payload: string }> = [];
     const notifier = createPushNotifier(api.storage, configFor(dir, keys), async (subscription, payload) => {
       sent.push({ endpoint: subscription.endpoint, payload });
