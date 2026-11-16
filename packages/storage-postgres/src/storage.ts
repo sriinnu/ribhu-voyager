@@ -1,26 +1,78 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Pool, type PoolClient } from "pg";
 
-import type {
-  Awaitable,
-  ConversationSummary,
-  ConversationView,
-  EntryRecord,
-  JsonObject,
-  ModelMessage,
-  QueueJob,
-  SettingPair,
-  SubmissionRow,
-  SubmissionStatus,
-  Storage,
-  ToolTaskRow,
-  ToolTaskStatus,
+import {
+  QUOTA_DAILY_TOKENS_KEY,
+  QUOTA_MONTHLY_COST_KEY,
+  type AuditEvent,
+  type AuditEventInput,
+  type Awaitable,
+  type ConversationSummary,
+  type ConversationView,
+  type EntryRecord,
+  type JsonObject,
+  type ModelMessage,
+  type QueueJob,
+  type Quota,
+  type SettingPair,
+  type Storage,
+  type SubmissionRow,
+  type SubmissionStatus,
+  type ToolTaskRow,
+  type ToolTaskStatus,
+  type UsageEvent,
+  type UsageEventInput,
+  type UsagePeriod,
+  type UsageSummary,
 } from "@ribhu-voyager/engine";
 
 import { MIGRATIONS } from "./migrations.js";
 
 const now = () => Date.now();
 const n = (value: unknown): number => Number(value);
+
+const DEFAULT_LIST_LIMIT = 50;
+
+function periodStart(period: UsagePeriod): number {
+  const date = new Date();
+  if (period === "day") {
+    return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+  }
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+}
+
+function limitSetting(value: string | undefined): number | null {
+  if (value === undefined || value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : null;
+}
+
+function usageEvent(row: Record<string, unknown>): UsageEvent {
+  return {
+    id: n(row.id),
+    tenantId: String(row.tenant_id),
+    conversationId: row.conversation_id === null ? null : n(row.conversation_id),
+    submissionId: row.submission_id === null ? null : n(row.submission_id),
+    provider: String(row.provider),
+    model: String(row.model),
+    inputTokens: n(row.input_tokens),
+    outputTokens: n(row.output_tokens),
+    costMicros: n(row.cost_micros),
+    createdAt: n(row.created_at),
+  };
+}
+
+function auditEvent(row: Record<string, unknown>): AuditEvent {
+  return {
+    id: n(row.id),
+    tenantId: String(row.tenant_id),
+    actor: String(row.actor),
+    action: String(row.action),
+    target: String(row.target),
+    ...(row.data ? { data: row.data as JsonObject } : {}),
+    createdAt: n(row.created_at),
+  };
+}
 
 type SubRow = SubmissionRow;
 
@@ -814,6 +866,118 @@ export class PostgresStorage implements Storage {
       key: String(row.key),
       value: String(row.value),
     }));
+  }
+
+  async recordUsage(event: UsageEventInput): Promise<void> {
+    await this.db().query(
+      `INSERT INTO usage_events(tenant_id, conversation_id, submission_id, provider, model,
+                                 input_tokens, output_tokens, cost_micros, created_at)
+       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        this.tenantId,
+        event.conversationId ?? null,
+        event.submissionId ?? null,
+        event.provider,
+        event.model,
+        Math.max(0, Math.trunc(event.inputTokens)),
+        Math.max(0, Math.trunc(event.outputTokens)),
+        Math.max(0, Math.trunc(event.costMicros ?? 0)),
+        event.createdAt ?? now(),
+      ],
+    );
+  }
+
+  async usageSummary(period: UsagePeriod): Promise<UsageSummary> {
+    const since = periodStart(period);
+    const result = await this.db().query(
+      `SELECT COUNT(*)::int AS events,
+              COALESCE(SUM(input_tokens), 0) AS input,
+              COALESCE(SUM(output_tokens), 0) AS output,
+              COALESCE(SUM(cost_micros), 0) AS cost
+       FROM usage_events WHERE tenant_id = $1 AND created_at >= $2`,
+      [this.tenantId, since],
+    );
+    const row = result.rows[0] ?? {};
+    const inputTokens = n(row.input);
+    const outputTokens = n(row.output);
+    return {
+      period,
+      since,
+      events: n(row.events),
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens + outputTokens,
+      costMicros: n(row.cost),
+    };
+  }
+
+  async listUsage(limit = DEFAULT_LIST_LIMIT): Promise<UsageEvent[]> {
+    const result = await this.db().query(
+      `SELECT id, tenant_id, conversation_id, submission_id, provider, model,
+              input_tokens, output_tokens, cost_micros, created_at
+       FROM usage_events WHERE tenant_id = $1
+       ORDER BY created_at DESC, id DESC LIMIT $2`,
+      [this.tenantId, Math.max(1, Math.trunc(limit))],
+    );
+    return result.rows.map(usageEvent);
+  }
+
+  async recordAudit(event: AuditEventInput): Promise<void> {
+    await this.db().query(
+      `INSERT INTO audit_events(tenant_id, actor, action, target, data, created_at)
+       VALUES($1, $2, $3, $4, $5, $6)`,
+      [
+        this.tenantId,
+        event.actor,
+        event.action,
+        event.target,
+        event.data === undefined ? null : JSON.stringify(event.data),
+        event.createdAt ?? now(),
+      ],
+    );
+  }
+
+  async listAudit(limit = DEFAULT_LIST_LIMIT): Promise<AuditEvent[]> {
+    const result = await this.db().query(
+      `SELECT id, tenant_id, actor, action, target, data, created_at
+       FROM audit_events WHERE tenant_id = $1
+       ORDER BY created_at DESC, id DESC LIMIT $2`,
+      [this.tenantId, Math.max(1, Math.trunc(limit))],
+    );
+    return result.rows.map(auditEvent);
+  }
+
+  async quota(): Promise<Quota> {
+    const [daily, monthly] = await Promise.all([
+      this.getSetting(QUOTA_DAILY_TOKENS_KEY),
+      this.getSetting(QUOTA_MONTHLY_COST_KEY),
+    ]);
+    return {
+      dailyTokens: limitSetting(daily),
+      monthlyCostMicros: limitSetting(monthly),
+    };
+  }
+
+  async setQuota(next: Partial<Quota>): Promise<void> {
+    if (next.dailyTokens !== undefined) {
+      await this.setSetting(
+        QUOTA_DAILY_TOKENS_KEY,
+        next.dailyTokens === null ? "" : String(Math.max(0, Math.trunc(next.dailyTokens))),
+      );
+    }
+    if (next.monthlyCostMicros !== undefined) {
+      await this.setSetting(
+        QUOTA_MONTHLY_COST_KEY,
+        next.monthlyCostMicros === null
+          ? ""
+          : String(Math.max(0, Math.trunc(next.monthlyCostMicros))),
+      );
+    }
+  }
+
+  async listTenants(): Promise<string[]> {
+    const result = await this.db().query("SELECT id FROM tenants ORDER BY id");
+    return result.rows.map((row) => String(row.id));
   }
 
   async requestCancel(conversationId: number): Promise<void> {

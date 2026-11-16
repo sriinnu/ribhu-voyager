@@ -18,3 +18,12 @@ export class LeaseLost extends Error {
     this.name = "LeaseLost";
   }
 }
+
+/** Admission refused because the tenant's daily token or monthly cost quota is spent. */
+export class QuotaExceeded extends Error {
+  readonly code = "quota_exceeded";
+  constructor(message: string) {
+    super(message);
+    this.name = "QuotaExceeded";
+  }
+}

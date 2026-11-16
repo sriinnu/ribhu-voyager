@@ -93,6 +93,8 @@ export type ApiRuntime = GatewayRuntime & {
   serverId: string;
   startedAt: number;
   demo: boolean;
+  /** Tenant this runtime's storage is scoped to. */
+  tenantId: string;
   model: ModelRef;
   storage: Storage;
   pushPublicKey?: string;
@@ -267,6 +269,12 @@ export async function createApiRuntime(
               kind: "pi.approval",
               data: { callId, status: "approved", decidedAt },
             });
+            await storage.recordAudit({
+              actor: "user",
+              action: "approval.approved",
+              target: `${conversationId}:${callId}`,
+              data: { conversationId, callId, always: true, fallback: true },
+            });
             return true;
           }
           await storage.appendEntry({
@@ -277,6 +285,22 @@ export async function createApiRuntime(
               status: approved ? "approved" : "denied",
               decidedAt,
               ...(always ? { always: true } : {}),
+            },
+          });
+          await storage.recordAudit({
+            actor: "user",
+            action: always
+              ? "approval.always"
+              : approved
+                ? "approval.approved"
+                : "approval.denied",
+            target: `${conversationId}:${callId}`,
+            data: {
+              conversationId,
+              callId,
+              ...(canWriteRule && typeof ruleName === "string"
+                ? { tool: ruleName }
+                : {}),
             },
           });
           if (always) {
@@ -301,6 +325,7 @@ export async function createApiRuntime(
     serverId: randomUUID(),
     startedAt: Date.now(),
     demo: config.demo,
+    tenantId: tenant,
     model,
     storage,
     ...(config.vapidPublicKey ? { pushPublicKey: config.vapidPublicKey } : {}),
@@ -356,6 +381,12 @@ export async function createApiRuntime(
             async setMode(mode: AuthMode) {
               await storage.setSetting("auth_mode", mode);
               await storage.setSetting("auth_error", "");
+              await storage.recordAudit({
+                actor: "user",
+                action: "auth.mode_changed",
+                target: "auth",
+                data: { mode },
+              });
               return { ...(await readAuth()), mode };
             },
           } satisfies GatewayAuth,

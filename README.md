@@ -415,6 +415,8 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 | `RIBBHU_VAPID_PUBLIC_KEY` | unset | Web Push VAPID public key |
 | `RIBBHU_VAPID_PRIVATE_KEY` | unset | Web Push VAPID private key |
 | `RIBBHU_VAPID_SUBJECT` | `mailto:hello@srinivas.dev` | VAPID subject |
+| `RIBBHU_ADMIN_TOKEN` | unset | Bearer token for `/admin` and `/api/admin/*`; unset disables them |
+| `RIBBHU_COST_MICROS_PER_1K_TOKENS` | `0` | Usage pricing for quota/dashboard cost reporting |
 | `RIBBHU_STORAGE` | `sqlite` | `sqlite` or `postgres` |
 | `RIBBHU_POSTGRES_URL` | unset | Postgres URL when storage is `postgres` |
 | `RIBBHU_DEMO` | unset | `1` forces the scripted provider |
@@ -427,7 +429,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 ## Tests and development
 
 ```bash
-npm test          # 76 tests
+npm test          # 85 tests
 npm run typecheck
 npm run build
 npm run dev
@@ -520,5 +522,7 @@ next step. See [docs/ARCHITECTURE-UPGRADE.md](docs/ARCHITECTURE-UPGRADE.md) and 
   a token-storage seam. No signing, OAuth exchange, secure native storage, or APNs/FCM push yet.
 - **Single SQLite writer.** One gateway/worker pair per data directory. Postgres supports multiple
   workers with leases and fences.
-- **No billing, quotas, usage events, or audit dashboards.** Usage is a per-conversation doc.
+- **Usage, quotas, and audit are minimal.** Usage events and audit rows are recorded and can be
+  capped/inspected from an optional admin token + dashboard; there is no billing, invoicing, or
+  per-user roles. See [docs/SAAS-CONTROL-PLANE.md](docs/SAAS-CONTROL-PLANE.md).
 - **HTTP is cleartext.** The token gates the agent, not the traffic. Use TLS beyond your own LAN.

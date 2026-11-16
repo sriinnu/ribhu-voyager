@@ -111,6 +111,11 @@ export type EngineOptions = {
   compactionKeepEntries?: number;
   /** Tool policy. `ask` pauses before bash/write/edit for a journaled decision. */
   approvals?: ApprovalsMode;
+  /**
+   * Cost charged for one model turn, in millionths of a currency unit. The
+   * worker derives it from the configured rate; defaults to 0 (unknown).
+   */
+  costMicros?: (usage: Usage) => number;
   /** Called once when a new approval request is journaled (push notification hook). */
   onApprovalRequest?: (
     conversationId: number,
@@ -174,6 +179,7 @@ export class Engine {
   private readonly compactionThresholdChars: number;
   private readonly compactionKeepEntries: number;
   private readonly approvals: ApprovalsMode;
+  private readonly costMicros: (usage: Usage) => number;
   private readonly onApprovalRequest?: EngineOptions["onApprovalRequest"];
   private readonly autoRun: boolean;
   private readonly recoverOnOpen: boolean;
@@ -202,6 +208,7 @@ export class Engine {
     this.compactionThresholdChars = options.compactionThresholdChars ?? 240_000;
     this.compactionKeepEntries = options.compactionKeepEntries ?? 12;
     this.approvals = options.approvals ?? "allow";
+    this.costMicros = options.costMicros ?? (() => 0);
     this.onApprovalRequest = options.onApprovalRequest;
     this.autoRun = options.autoRun ?? true;
     this.recoverOnOpen = options.recoverOnOpen ?? true;
@@ -419,6 +426,12 @@ export class Engine {
             data: { callId, status: "approved", decidedAt },
           });
         });
+        await this.audit(
+          "approval.approved",
+          `${conversationId}:${callId}`,
+          { conversationId, callId, always: true, fallback: true },
+          "user",
+        );
         this.log(
           `approval approved conversation=${conversationId} call=${callId} (always without request args)`,
         );
@@ -442,6 +455,12 @@ export class Engine {
           },
         });
       });
+      await this.audit(
+        "approval.always",
+        `${conversationId}:${callId}`,
+        { conversationId, callId, tool: name, argsKey },
+        "user",
+      );
       this.log(
         `approval always conversation=${conversationId} call=${callId} tool=${name} rule=${argsKey}`,
       );
@@ -458,6 +477,12 @@ export class Engine {
         },
       });
     });
+    await this.audit(
+      normalized === "approve" ? "approval.approved" : "approval.denied",
+      `${conversationId}:${callId}`,
+      { conversationId, callId },
+      "user",
+    );
     this.log(
       `approval ${normalized === "approve" ? "approved" : "denied"} conversation=${conversationId} call=${callId}`,
     );
@@ -825,7 +850,11 @@ export class Engine {
             kind: "pi.assistant",
             model: [assistant],
           });
-          await this.addUsage(conversationId, assistant.usage);
+          await this.addUsage(
+            conversationId,
+            assistant.usage,
+            inputIds[0] ?? null,
+          );
           // Tool intents are committed with the assistant entry. A crash after
           // this commit leaves a durable task, so an unsafe tool is never
           // silently re-executed from a bare tool-call block.
@@ -1225,6 +1254,16 @@ ${data.summary}`
               },
             });
           });
+          await this.audit(
+            "approval.auto",
+            `${conversationId}:${call.id}`,
+            {
+              conversationId,
+              callId: call.id,
+              tool: call.name,
+              ruleId: rule.id,
+            },
+          );
           this.log(
             `approval auto-approved conversation=${conversationId} call=${call.id} tool=${call.name} rule=${rule.id}`,
           );
@@ -1246,6 +1285,16 @@ ${data.summary}`
             },
           });
         });
+        await this.audit(
+          "approval.requested",
+          `${conversationId}:${call.id}`,
+          {
+            conversationId,
+            callId: call.id,
+            tool: call.name,
+            args: call.arguments,
+          },
+        );
         this.log(
           `approval requested conversation=${conversationId} call=${call.id} tool=${call.name}`,
         );
@@ -1285,6 +1334,16 @@ ${data.summary}`
               },
             });
           });
+          await this.audit(
+            "approval.denied",
+            `${conversationId}:${call.id}`,
+            {
+              conversationId,
+              callId: call.id,
+              tool: call.name,
+              reason: "timeout",
+            },
+          );
           this.log(
             `approval timed out conversation=${conversationId} call=${call.id}`,
           );
@@ -1501,7 +1560,11 @@ ${data.summary}`
     await this.emit(conversationId);
   }
 
-  private async addUsage(conversationId: number, usage: Usage): Promise<void> {
+  private async addUsage(
+    conversationId: number,
+    usage: Usage,
+    submissionId?: number | null,
+  ): Promise<void> {
     const docs = await this.storage.docs(conversationId);
     const previous = docs["pi.usage"] as
       | { input?: number; output?: number; totalTokens?: number }
@@ -1511,6 +1574,27 @@ ${data.summary}`
       output: (previous?.output ?? 0) + usage.output,
       totalTokens: (previous?.totalTokens ?? 0) + usage.totalTokens,
     });
+    // Durable per-event usage for quotas and the admin dashboard. Cost is
+    // configured by the worker; unknown pricing records 0 micros.
+    await this.storage.recordUsage({
+      conversationId,
+      submissionId: submissionId ?? null,
+      provider: this.model.provider,
+      model: this.model.modelId,
+      inputTokens: usage.input,
+      outputTokens: usage.output,
+      costMicros: Math.max(0, Math.trunc(this.costMicros(usage))),
+    });
+  }
+
+  /** Best-effort control-plane audit record (tenant scoping lives in storage). */
+  private async audit(
+    action: string,
+    target: string,
+    data: JsonObject,
+    actor = "engine",
+  ): Promise<void> {
+    await this.storage.recordAudit({ actor, action, target, data });
   }
 
   private liveDoc(conversationId: number): JsonObject {

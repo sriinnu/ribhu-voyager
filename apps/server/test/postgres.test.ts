@@ -88,7 +88,7 @@ test(
       );
       assert.deepEqual(
         migrations.rows.map((row) => Number(row.version)),
-        [1, 2, 3, 4, 5],
+        [1, 2, 3, 4, 5, 6],
       );
       const search = await storage.searchConversations("migrated message");
       assert.equal(search.length, 1);

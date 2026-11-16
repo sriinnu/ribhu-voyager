@@ -2,21 +2,30 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import type {
-  ConversationView,
-  EntryRecord,
-  Json,
-  JsonObject,
-  ModelMessage,
-  QueueJob,
-  SettingPair,
-  Storage,
-  SubmissionOptions,
-  SubmissionRow,
-  SubmissionStatus,
-  ToolTaskRow,
-  ToolTaskStatus,
-  Awaitable,
+import {
+  QUOTA_DAILY_TOKENS_KEY,
+  QUOTA_MONTHLY_COST_KEY,
+  type AuditEvent,
+  type AuditEventInput,
+  type Awaitable,
+  type ConversationView,
+  type EntryRecord,
+  type Json,
+  type JsonObject,
+  type ModelMessage,
+  type QueueJob,
+  type Quota,
+  type SettingPair,
+  type Storage,
+  type SubmissionOptions,
+  type SubmissionRow,
+  type SubmissionStatus,
+  type ToolTaskRow,
+  type ToolTaskStatus,
+  type UsageEvent,
+  type UsageEventInput,
+  type UsagePeriod,
+  type UsageSummary,
 } from "@ribhu-voyager/engine";
 
 const SCHEMA = `
@@ -103,6 +112,29 @@ CREATE TABLE IF NOT EXISTS tool_tasks (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tool_tasks_status ON tool_tasks(status);
+CREATE TABLE IF NOT EXISTS usage_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  conversation_id INTEGER,
+  submission_id INTEGER,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_micros INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS usage_events_tenant_time ON usage_events(tenant_id, created_at);
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target TEXT NOT NULL,
+  data TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_events_tenant_time ON audit_events(tenant_id, created_at);
 `;
 
 function parseJson<T>(value: string | null): T | undefined {
@@ -112,6 +144,73 @@ function parseJson<T>(value: string | null): T | undefined {
   } catch {
     return undefined;
   }
+}
+
+const DEFAULT_TENANT = "default";
+const DEFAULT_LIST_LIMIT = 50;
+
+function periodStart(period: UsagePeriod): number {
+  const now = new Date();
+  if (period === "day") {
+    return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  }
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+}
+
+function limitSetting(value: string | undefined): number | null {
+  if (value === undefined || value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : null;
+}
+
+type UsageRow = {
+  id: number;
+  tenant_id: string;
+  conversation_id: number | null;
+  submission_id: number | null;
+  provider: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost_micros: number;
+  created_at: number;
+};
+
+type AuditRow = {
+  id: number;
+  tenant_id: string;
+  actor: string;
+  action: string;
+  target: string;
+  data: string | null;
+  created_at: number;
+};
+
+function usageEvent(row: UsageRow): UsageEvent {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    conversationId: row.conversation_id,
+    submissionId: row.submission_id,
+    provider: row.provider,
+    model: row.model,
+    inputTokens: row.input_tokens,
+    outputTokens: row.output_tokens,
+    costMicros: row.cost_micros,
+    createdAt: row.created_at,
+  };
+}
+
+function auditEvent(row: AuditRow): AuditEvent {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    actor: row.actor,
+    action: row.action,
+    target: row.target,
+    ...(row.data ? { data: JSON.parse(row.data) as JsonObject } : {}),
+    createdAt: row.created_at,
+  };
 }
 
 export class Db implements Storage {
@@ -1033,6 +1132,121 @@ export class Db implements Storage {
         "SELECT key, value FROM settings WHERE substr(key, 1, ?) = ? ORDER BY key",
       )
       .all(prefix.length, prefix) as SettingPair[];
+  }
+
+  recordUsage(event: UsageEventInput): void {
+    this.db
+      .prepare(
+        `INSERT INTO usage_events(tenant_id, conversation_id, submission_id, provider, model, input_tokens, output_tokens, cost_micros, created_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        DEFAULT_TENANT,
+        event.conversationId ?? null,
+        event.submissionId ?? null,
+        event.provider,
+        event.model,
+        Math.max(0, Math.trunc(event.inputTokens)),
+        Math.max(0, Math.trunc(event.outputTokens)),
+        Math.max(0, Math.trunc(event.costMicros ?? 0)),
+        event.createdAt ?? Date.now(),
+      );
+  }
+
+  usageSummary(period: UsagePeriod): UsageSummary {
+    const since = periodStart(period);
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS events,
+                COALESCE(SUM(input_tokens), 0) AS input,
+                COALESCE(SUM(output_tokens), 0) AS output,
+                COALESCE(SUM(cost_micros), 0) AS cost
+         FROM usage_events WHERE tenant_id = ? AND created_at >= ?`,
+      )
+      .get(DEFAULT_TENANT, since) as {
+      events: number;
+      input: number;
+      output: number;
+      cost: number;
+    };
+    const inputTokens = Number(row.input);
+    const outputTokens = Number(row.output);
+    return {
+      period,
+      since,
+      events: Number(row.events),
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens + outputTokens,
+      costMicros: Number(row.cost),
+    };
+  }
+
+  listUsage(limit = DEFAULT_LIST_LIMIT): UsageEvent[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, tenant_id, conversation_id, submission_id, provider, model,
+                input_tokens, output_tokens, cost_micros, created_at
+         FROM usage_events WHERE tenant_id = ?
+         ORDER BY created_at DESC, id DESC LIMIT ?`,
+      )
+      .all(DEFAULT_TENANT, Math.max(1, Math.trunc(limit))) as UsageRow[];
+    return rows.map(usageEvent);
+  }
+
+  recordAudit(event: AuditEventInput): void {
+    this.db
+      .prepare(
+        `INSERT INTO audit_events(tenant_id, actor, action, target, data, created_at)
+         VALUES(?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        DEFAULT_TENANT,
+        event.actor,
+        event.action,
+        event.target,
+        event.data === undefined ? null : JSON.stringify(event.data),
+        event.createdAt ?? Date.now(),
+      );
+  }
+
+  listAudit(limit = DEFAULT_LIST_LIMIT): AuditEvent[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, tenant_id, actor, action, target, data, created_at
+         FROM audit_events WHERE tenant_id = ?
+         ORDER BY created_at DESC, id DESC LIMIT ?`,
+      )
+      .all(DEFAULT_TENANT, Math.max(1, Math.trunc(limit))) as AuditRow[];
+    return rows.map(auditEvent);
+  }
+
+  quota(): Quota {
+    return {
+      dailyTokens: limitSetting(this.getSetting(QUOTA_DAILY_TOKENS_KEY)),
+      monthlyCostMicros: limitSetting(this.getSetting(QUOTA_MONTHLY_COST_KEY)),
+    };
+  }
+
+  setQuota(next: Partial<Quota>): void {
+    if (next.dailyTokens !== undefined) {
+      this.setSetting(
+        QUOTA_DAILY_TOKENS_KEY,
+        next.dailyTokens === null ? "" : String(Math.max(0, Math.trunc(next.dailyTokens))),
+      );
+    }
+    if (next.monthlyCostMicros !== undefined) {
+      this.setSetting(
+        QUOTA_MONTHLY_COST_KEY,
+        next.monthlyCostMicros === null
+          ? ""
+          : String(Math.max(0, Math.trunc(next.monthlyCostMicros))),
+      );
+    }
+  }
+
+  listTenants(): string[] {
+    return [DEFAULT_TENANT];
   }
 
   requestCancel(conversationId: number): void {

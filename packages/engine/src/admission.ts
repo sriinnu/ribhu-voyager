@@ -1,6 +1,32 @@
-import { ConversationBusy } from "./errors.js";
+import { ConversationBusy, QuotaExceeded } from "./errors.js";
 import type { Storage } from "./ports.js";
 import type { SubmissionDraft, SubmissionInfo } from "./types.js";
+
+/**
+ * Refuse work when the tenant has spent its daily token or monthly cost quota.
+ * The limits live in tenant-scoped settings, so SQLite (one tenant) and
+ * Postgres (RLS) share the same check.
+ */
+export async function enforceQuota(storage: Storage): Promise<void> {
+  const quota = await storage.quota();
+  if (quota.dailyTokens === null && quota.monthlyCostMicros === null) return;
+  if (quota.dailyTokens !== null) {
+    const day = await storage.usageSummary("day");
+    if (day.totalTokens >= quota.dailyTokens) {
+      throw new QuotaExceeded(
+        `Daily token quota exceeded: ${day.totalTokens} of ${quota.dailyTokens} tokens used today.`,
+      );
+    }
+  }
+  if (quota.monthlyCostMicros !== null) {
+    const month = await storage.usageSummary("month");
+    if (month.costMicros >= quota.monthlyCostMicros) {
+      throw new QuotaExceeded(
+        `Monthly cost quota exceeded: ${month.costMicros} of ${quota.monthlyCostMicros} micros spent this month.`,
+      );
+    }
+  }
+}
 
 /**
  * Durably admit an input and enqueue a run. Shared by the API and the engine.
@@ -16,6 +42,8 @@ export async function admitSubmission(
 
   const existing = await storage.findSubmission(conversationId, draft.requestId);
   if (existing) return { id: existing.id, status: existing.status };
+
+  await enforceQuota(storage);
 
   if (draft.whenBusy === "reject" && (await storage.busy(conversationId))) {
     throw new ConversationBusy();

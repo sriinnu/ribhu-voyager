@@ -14,6 +14,7 @@ import {
 } from "@ribhu-voyager/storage-postgres";
 
 import type { ApiRuntime } from "./api-runtime.js";
+import { createAdminApi } from "./admin.js";
 import { healthPayload } from "./health.js";
 import { createRuntimePool } from "./runtime-pool.js";
 import { createStaticHandler } from "./static.js";
@@ -44,6 +45,30 @@ function requestToken(request: IncomingMessage, url: URL): string | undefined {
   return url.searchParams.get("token") ?? undefined;
 }
 
+/** Read a small admin request body (quota POST); larger bodies are truncated to a 400. */
+function readAdminBody(request: IncomingMessage, limit = 8_192): Promise<string> {
+  return new Promise((resolve) => {
+    let body = "";
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve(body);
+    };
+    request.setEncoding("utf8");
+    request.on("data", (chunk: string) => {
+      if (settled) return;
+      body += chunk;
+      if (body.length >= limit) {
+        body = body.slice(0, limit);
+        finish();
+      }
+    });
+    request.on("end", finish);
+    request.on("error", finish);
+  });
+}
+
 const config = loadConfig();
 const startedAt = Date.now();
 const hasTenantTokens = config.storage === "postgres" && Boolean(config.postgresUrl);
@@ -56,6 +81,10 @@ const pool = createRuntimePool(
     ? (token: string) => resolveApiToken(config.postgresUrl!, token)
     : undefined,
 );
+
+// Admin control plane: usage/audit/quotas + the /admin dashboard. Every route
+// 404s when RIBBHU_ADMIN_TOKEN is unset.
+const admin = createAdminApi(config);
 
 const distDir = resolve(fileURLToPath(new URL("../../mobile/dist/", import.meta.url)));
 const serveStatic = createStaticHandler(distDir);
@@ -81,6 +110,23 @@ const server = createServer((request, response) => {
       });
       response.end(JSON.stringify(payload));
       return;
+    }
+
+    if (url.pathname === "/admin" || url.pathname.startsWith("/api/admin")) {
+      const adminResponse = await admin.handle({
+        method: request.method ?? "GET",
+        pathname: url.pathname,
+        headers: { authorization: request.headers.authorization },
+        query: url.searchParams,
+        ...(request.method === "POST"
+          ? { body: await readAdminBody(request) }
+          : {}),
+      });
+      if (adminResponse) {
+        response.writeHead(adminResponse.status, adminResponse.headers);
+        response.end(adminResponse.body);
+        return;
+      }
     }
 
     const handled = await serveStatic(request, response);
@@ -129,6 +175,7 @@ const shutdown = async (signal: string) => {
   console.log(`\n${color.dim}${signal} — closing storage…${color.reset}`);
   try {
     await gateway.close();
+    await admin.close();
     await pool.close();
     await closeApiTokenPools();
   } finally {

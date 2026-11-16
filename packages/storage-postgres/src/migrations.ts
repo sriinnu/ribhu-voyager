@@ -190,10 +190,50 @@ ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires_at BIGINT;
 ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS id BIGSERIAL;
 `;
 
+const SAAS_CONTROL_PLANE = `
+CREATE TABLE IF NOT EXISTS usage_events (
+  id SERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  conversation_id INTEGER,
+  submission_id INTEGER,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_micros BIGINT NOT NULL DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS usage_events_tenant_time ON usage_events(tenant_id, created_at);
+ALTER TABLE usage_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE usage_events FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON usage_events;
+CREATE POLICY tenant_isolation ON usage_events
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+CREATE TABLE IF NOT EXISTS audit_events (
+  id SERIAL PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target TEXT NOT NULL,
+  data JSONB,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_events_tenant_time ON audit_events(tenant_id, created_at);
+ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_events FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON audit_events;
+CREATE POLICY tenant_isolation ON audit_events
+  USING (tenant_id = current_setting('app.tenant_id', true))
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+`;
+
 export const MIGRATIONS: Migration[] = [
   { version: 1, name: "init", sql: INIT },
   { version: 2, name: "postgres-fts", sql: SEARCH },
   { version: 3, name: "tenancy-rls", sql: TENANCY },
   { version: 4, name: "tenant-control-plane", sql: TENANT_CONTROL },
   { version: 5, name: "token-lifecycle", sql: TOKEN_LIFECYCLE },
+  { version: 6, name: "saas-control-plane", sql: SAAS_CONTROL_PLANE },
 ];

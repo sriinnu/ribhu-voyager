@@ -84,6 +84,67 @@ export type Awaitable<T> = T | Promise<T>;
 /** One `settings` row exposed by `settingsMatching`. */
 export type SettingPair = { key: string; value: string };
 
+export type UsagePeriod = "day" | "month";
+
+export type UsageSummary = {
+  period: UsagePeriod;
+  /** Epoch ms where the counted window starts (UTC day or month boundary). */
+  since: number;
+  events: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costMicros: number;
+};
+
+export type UsageEventInput = {
+  conversationId?: number | null;
+  submissionId?: number | null;
+  provider: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  /** Cost in millionths of a currency unit; 0 when no rate is configured. */
+  costMicros?: number;
+  createdAt?: number;
+};
+
+export type UsageEvent = UsageEventInput & {
+  id: number;
+  tenantId: string;
+  conversationId: number | null;
+  submissionId: number | null;
+  costMicros: number;
+  createdAt: number;
+};
+
+export type AuditEventInput = {
+  actor: string;
+  action: string;
+  target: string;
+  data?: JsonObject;
+  createdAt?: number;
+};
+
+export type AuditEvent = AuditEventInput & {
+  id: number;
+  tenantId: string;
+  createdAt: number;
+};
+
+/** Per-tenant limits; null means "no limit configured". */
+export type Quota = {
+  dailyTokens: number | null;
+  monthlyCostMicros: number | null;
+};
+
+/**
+ * Settings keys for quota limits. Settings are already tenant-scoped in
+ * Postgres (RLS); SQLite has one default tenant.
+ */
+export const QUOTA_DAILY_TOKENS_KEY = "daily_tokens";
+export const QUOTA_MONTHLY_COST_KEY = "monthly_cost_micros";
+
 /**
  * The journal boundary as implemented synchronously by SQLite. `Storage`
  * below widens every method to `Awaitable`, so the same engine can run on
@@ -150,6 +211,17 @@ export interface SyncStorage {
   setSetting(key: string, value: string): void;
   /** Every setting whose key starts with `prefix`, ordered by key. */
   settingsMatching(prefix: string): SettingPair[];
+
+  recordUsage(event: UsageEventInput): void;
+  usageSummary(period: UsagePeriod): UsageSummary;
+  listUsage(limit?: number): UsageEvent[];
+  recordAudit(event: AuditEventInput): void;
+  listAudit(limit?: number): AuditEvent[];
+  quota(): Quota;
+  /** Update only the provided limits; `null` clears a limit. */
+  setQuota(quota: Partial<Quota>): void;
+  /** Tenants known to this storage (SQLite has a single default tenant). */
+  listTenants(): string[];
 
   requestCancel(conversationId: number): void;
   isCancelRequested(conversationId: number): boolean;

@@ -114,6 +114,10 @@ export async function startWorker(
     instructions: INSTRUCTIONS,
     maxWindowEntries: config.maxWindowEntries,
     approvals: config.approvals ?? "allow",
+    costMicros: (usage) =>
+      Math.round(
+        ((usage.input + usage.output) * (config.costMicrosPer1kTokens ?? 0)) / 1000,
+      ),
     onApprovalRequest: (conversationId, request) =>
       push.notify({ conversationId, ...request }),
     autoRun: false,
@@ -214,6 +218,12 @@ export async function startWorker(
       await auth.setMode(requested);
       await publishAuth();
       await storage.setSetting("auth_error", "");
+      await storage.recordAudit({
+        actor: "worker",
+        action: "auth.mode_applied",
+        target: "auth",
+        data: { mode: requested },
+      });
       nextAuthAt = 0;
     } catch (error) {
       nextAuthAt = Date.now() + 5_000;

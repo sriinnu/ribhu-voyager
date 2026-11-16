@@ -32,6 +32,10 @@ export type Config = {
   vapidPublicKey?: string;
   vapidPrivateKey?: string;
   vapidSubject?: string;
+  /** Bearer token for the admin API/dashboard. Admin routes 404 when unset. */
+  adminToken?: string;
+  /** Usage pricing in micros per 1k tokens; 0/absent records zero cost. */
+  costMicrosPer1kTokens?: number;
 };
 
 // Resolve against the repository, not the caller's cwd: npm workspace scripts run
@@ -121,6 +125,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
+  const adminToken = env.RIBBHU_ADMIN_TOKEN?.trim() || undefined;
+
+  const costRaw = env.RIBBHU_COST_MICROS_PER_1K_TOKENS?.trim();
+  const costMicrosPer1kTokens = costRaw === undefined || costRaw === ""
+    ? 0
+    : Number.parseFloat(costRaw);
+  if (!Number.isFinite(costMicrosPer1kTokens) || costMicrosPer1kTokens < 0) {
+    throw new Error(
+      "RIBBHU_COST_MICROS_PER_1K_TOKENS must be a non-negative number.",
+    );
+  }
+
   const sandboxRaw = env.RIBBHU_SANDBOX?.trim().toLowerCase() || "local";
   if (sandboxRaw !== "local" && sandboxRaw !== "docker") {
     throw new Error(
@@ -158,6 +174,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       : {}),
     sandboxImage: env.RIBBHU_SANDBOX_IMAGE?.trim() || "node:24-bookworm",
     ...(anthropicApiKey ? { anthropicApiKey } : {}),
+    ...(adminToken ? { adminToken } : {}),
+    ...(costMicrosPer1kTokens > 0 ? { costMicrosPer1kTokens } : {}),
   };
 }
 
@@ -170,6 +188,8 @@ export function describeConfig(config: Config): string {
     `  approvals ${config.approvals ?? "allow"}`,
     `  sandbox   ${config.sandbox ?? "local"}${config.sandbox === "docker" ? ` (${config.sandboxImage ?? "node:24-bookworm"})` : ""}`,
     `  push      ${config.vapidPublicKey ? "Web Push enabled" : "disabled (set RIBBHU_VAPID_*)"}`,
+    `  admin     ${config.adminToken ? "enabled at /admin" : "disabled (set RIBBHU_ADMIN_TOKEN)"}`,
+    `  pricing   ${config.costMicrosPer1kTokens ? `${config.costMicrosPer1kTokens} micros / 1k tokens` : "unset (usage cost recorded as 0)"}`,
   ];
   return lines.join("\n");
 }
