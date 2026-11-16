@@ -17,7 +17,11 @@ import { Db } from "@ribhu-voyager/storage-sqlite";
 import type { ApiRuntime } from "./api-runtime.js";
 import { createAdminApi } from "./admin.js";
 import { healthResponse } from "./health.js";
-import { createRuntimePool, runtimeForGateway } from "./runtime-pool.js";
+import {
+  createRuntimePool,
+  isCapacityExceeded,
+  runtimeForGateway,
+} from "./runtime-pool.js";
 import { createStaticHandler } from "./static.js";
 
 const color = {
@@ -240,6 +244,23 @@ const gateway = attachGateway(
     allowAnonymous: config.allowAnon === true,
     allowedOrigins: config.allowedOrigins ?? [],
     rateLimit: { limit: config.rateLimitPerMinute ?? 120, windowMs: 60_000 },
+    // R6: WebSocket connections are the client-activity signal for eviction.
+    onRuntimeConnect: async (runtime, token) => {
+      const acquired = await pool.acquire(token);
+      if (acquired === undefined) {
+        throw new Error("Tenant runtime disappeared during upgrade.");
+      }
+      if (isCapacityExceeded(acquired)) throw new Error(acquired.message);
+      if (acquired.runtime !== runtime) {
+        // The idle runtime was evicted between resolve and acquire; do not let
+        // the client keep a closed runtime.
+        pool.release(acquired.runtime);
+        throw new Error("Tenant runtime was evicted during upgrade; retry.");
+      }
+    },
+    onRuntimeDisconnect: (runtime) => {
+      pool.release(runtime as ApiRuntime);
+    },
   },
 );
 

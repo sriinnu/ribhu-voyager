@@ -9,6 +9,14 @@ import {
 } from "./quota.js";
 import { seedConversation } from "./conversation.js";
 import { LeaseLost, RunBudgetExceeded } from "./errors.js";
+import {
+  DEFAULT_PROVIDER_RETRY,
+  classifyProviderError,
+  providerTimeoutError,
+  retryDelayMs,
+  type ProviderError,
+  type RetryPolicy,
+} from "./provider-errors.js";
 import type {
   Awaitable,
   Storage,
@@ -27,6 +35,7 @@ import type {
   ModelMessage,
   ModelRef,
   Provider,
+  ProviderEvent,
   SubmissionDraft,
   SubmissionInfo,
   ToolContext,
@@ -140,6 +149,11 @@ export type EngineOptions = {
   tokenBudget?: number;
   /** Max cost (micros) one run may spend; enforced before every model turn. */
   costBudgetMicros?: number;
+  /**
+   * Provider retry/backoff/timeout policy. Defaults to 4 attempts, 500ms
+   * exponential backoff with jitter, 30s cap and a 120s per-attempt timeout.
+   */
+  providerRetry?: Partial<RetryPolicy>;
   /** Called once when a new approval request is journaled (push notification hook). */
   onApprovalRequest?: (
     conversationId: number,
@@ -207,6 +221,7 @@ export class Engine {
   private readonly costMicros: (usage: Usage) => number;
   private readonly tokenBudget: number;
   private readonly costBudgetMicros: number;
+  private readonly providerRetry: RetryPolicy;
   private readonly onApprovalRequest?: EngineOptions["onApprovalRequest"];
   private readonly autoRun: boolean;
   private readonly recoverOnOpen: boolean;
@@ -252,6 +267,18 @@ export class Engine {
       options.costBudgetMicros !== undefined
         ? Math.max(0, Math.trunc(options.costBudgetMicros))
         : 0;
+    this.providerRetry = {
+      ...DEFAULT_PROVIDER_RETRY,
+      ...options.providerRetry,
+    };
+    this.providerRetry.maxAttempts = Math.max(
+      1,
+      Math.trunc(this.providerRetry.maxAttempts),
+    );
+    this.providerRetry.timeoutMs = Math.max(
+      1,
+      Math.trunc(this.providerRetry.timeoutMs),
+    );
     this.onApprovalRequest = options.onApprovalRequest;
     this.autoRun = options.autoRun ?? true;
     this.recoverOnOpen = options.recoverOnOpen ?? true;
@@ -336,8 +363,10 @@ export class Engine {
       }
       if (messages.length === 0) return undefined;
 
-      let summary = "";
-      for await (const event of this.provider.stream({
+      // Summaries are only committed at the end, so a failed attempt is safe to
+      // retry; each attempt gets the same request deadline as a model turn.
+      const policy = this.providerRetry;
+      const request = {
         model: this.model.modelId,
         system:
           "Summarize this coding-agent conversation for an agent that must continue it. " +
@@ -346,10 +375,55 @@ export class Engine {
         messages,
         tools: [],
         maxTokens: 2048,
-        signal: effective,
-      })) {
-        if (effective.aborted) throw abortError();
-        if (event.type === "text") summary += event.text;
+      };
+      let summary = "";
+      for (let attempt = 1; ; attempt += 1) {
+        const attemptController = new AbortController();
+        const attemptSignal = AbortSignal.any([effective, attemptController.signal]);
+        const deadline = Date.now() + policy.timeoutMs;
+        summary = "";
+        const iterator = this.provider
+          .stream({ ...request, signal: attemptSignal })
+          [Symbol.asyncIterator]();
+        try {
+          while (true) {
+            const next = await this.nextProviderEvent(
+              iterator,
+              attemptSignal,
+              attemptController,
+              deadline,
+            );
+            if (next.done) break;
+            const event = next.value;
+            if (effective.aborted) throw abortError();
+            if (event.type === "text") summary += event.text;
+            else if (event.type === "error") {
+              throw classifyProviderError(new Error(event.message));
+            }
+          }
+          break;
+        } catch (error) {
+          if (effective.aborted) throw abortError();
+          const classified = classifyProviderError(error);
+          if (!classified.retryable || attempt >= policy.maxAttempts) {
+            throw classified;
+          }
+          const delay = Math.min(
+            300_000,
+            Math.max(
+              retryDelayMs(attempt, policy),
+              classified.retryAfterMs ?? 0,
+            ),
+          );
+          this.log(
+            `compaction provider retry ${attempt + 1}/${policy.maxAttempts} ` +
+              `in ${delay}ms (${classified.kind}): ${classified.message}`,
+          );
+          await sleepWithSignal(delay, effective);
+        } finally {
+          attemptController.abort();
+          void iterator.return?.().catch(() => undefined);
+        }
       }
       if (effective.aborted) throw abortError();
       summary = summary.trim();
@@ -1279,6 +1353,57 @@ ${data.summary}`
       : base;
   }
 
+  /**
+   * Await the next provider event, racing the attempt's request deadline and
+   * abort signal. A hung provider that ignores its signal is still released by
+   * the timeout (the iterator is returned by the caller's finally block).
+   */
+  private async nextProviderEvent(
+    iterator: AsyncIterator<ProviderEvent>,
+    signal: AbortSignal,
+    controller: AbortController,
+    deadline: number,
+  ): Promise<IteratorResult<ProviderEvent>> {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      controller.abort();
+      throw providerTimeoutError(this.providerRetry.timeoutMs);
+    }
+    return await new Promise<IteratorResult<ProviderEvent>>(
+      (resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", onAbort);
+        };
+        const finish = (fn: () => void) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          fn();
+        };
+        const timer = setTimeout(() => {
+          finish(() => {
+            controller.abort();
+            reject(providerTimeoutError(this.providerRetry.timeoutMs));
+          });
+        }, remaining);
+        const onAbort = () => {
+          finish(() => reject(new DOMException("Aborted", "AbortError")));
+        };
+        if (signal.aborted) {
+          finish(() => reject(new DOMException("Aborted", "AbortError")));
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+        iterator.next().then(
+          (result) => finish(() => resolve(result)),
+          (error) => finish(() => reject(error)),
+        );
+      },
+    );
+  }
+
   private async generate(
     conversationId: number,
     messages: ModelMessage[],
@@ -1305,33 +1430,90 @@ ${data.summary}`
     let stopReason: "stop" | "toolUse" | "length" = "stop";
     let usage: Usage = emptyUsage();
 
-    for await (const event of this.provider.stream({
+    const policy = this.providerRetry;
+    const system = await this.systemPrompt(conversationId);
+    const request = {
       model: this.model.modelId,
-      system: await this.systemPrompt(conversationId),
+      system,
       messages,
       tools: [...this.runner.specs],
       maxTokens:
         remainingTokens === undefined
           ? 8192
           : Math.min(8192, Math.max(1, remainingTokens)),
-      signal,
-    })) {
-      if (event.type === "text") {
-        text += event.text;
-        partial.content = [{ type: "text", text }];
-        live.generation = { attempt: 1, message: partial };
-        this.emitThrottled(conversationId);
-      } else if (event.type === "toolCall") {
-        toolCalls.push({
-          id: event.id,
-          name: event.name,
-          arguments: event.arguments,
-        });
-      } else if (event.type === "done") {
-        stopReason = event.stopReason;
-        usage = event.usage;
-      } else if (event.type === "error") {
-        throw new Error(event.message);
+    };
+
+    for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
+      // One attempt = one provider request with its own timeout/abort signal.
+      const controller = new AbortController();
+      const attemptSignal = AbortSignal.any([signal, controller.signal]);
+      const deadline = Date.now() + policy.timeoutMs;
+      live.generation = { attempt, message: partial };
+      this.emitThrottled(conversationId);
+      // Retrying after any event reached the consumer would duplicate output
+      // (and could duplicate a committed tool intent), so track it per attempt.
+      let delivered = false;
+      const iterator = this.provider
+        .stream({ ...request, signal: attemptSignal })
+        [Symbol.asyncIterator]();
+      try {
+        while (true) {
+          const next = await this.nextProviderEvent(
+            iterator,
+            attemptSignal,
+            controller,
+            deadline,
+          );
+          if (next.done) break;
+          const event = next.value;
+          if (event.type === "text") {
+            delivered = true;
+            text += event.text;
+            partial.content = [{ type: "text", text }];
+            live.generation = { attempt, message: partial };
+            this.emitThrottled(conversationId);
+          } else if (event.type === "toolCall") {
+            delivered = true;
+            toolCalls.push({
+              id: event.id,
+              name: event.name,
+              arguments: event.arguments,
+            });
+          } else if (event.type === "done") {
+            stopReason = event.stopReason;
+            usage = event.usage;
+          } else if (event.type === "error") {
+            throw classifyProviderError(new Error(event.message));
+          }
+        }
+        break;
+      } catch (error) {
+        // An external abort (Stop/lease loss) always wins over retries.
+        if (signal.aborted) {
+          throw new DOMException("Aborted", "AbortError");
+        }
+        const classified: ProviderError = classifyProviderError(error);
+        const retryable =
+          classified.retryable && !delivered && attempt < policy.maxAttempts;
+        if (!retryable) throw classified;
+        // Exponential backoff, but a server Retry-After hint wins over the
+        // backoff cap (bounded to a sane absolute maximum).
+        const delay = Math.min(
+          300_000,
+          Math.max(
+            retryDelayMs(attempt, policy),
+            classified.retryAfterMs ?? 0,
+          ),
+        );
+        this.log(
+          `provider retry ${attempt + 1}/${policy.maxAttempts} in ${delay}ms ` +
+            `(${classified.kind}): ${classified.message}`,
+        );
+        await sleepWithSignal(delay, signal);
+      } finally {
+        // Detach the finished/failed attempt; providers see their signal abort.
+        controller.abort();
+        void iterator.return?.().catch(() => undefined);
       }
     }
 

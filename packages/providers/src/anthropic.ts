@@ -1,10 +1,13 @@
-import type {
-  JsonObject,
-  ModelMessage,
-  Provider,
-  ProviderEvent,
-  ProviderRequest,
-  Usage,
+import {
+  ProviderError,
+  classifyProviderError,
+  providerHttpError,
+  type JsonObject,
+  type ModelMessage,
+  type Provider,
+  type ProviderEvent,
+  type ProviderRequest,
+  type Usage,
 } from "@ribhu-voyager/engine";
 
 export type AnthropicAuth = {
@@ -178,8 +181,11 @@ export class AnthropicProvider implements Provider {
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
-      throw new Error(
-        `Anthropic ${response.status} ${response.statusText}: ${body.slice(0, 800)}`,
+      throw providerHttpError(
+        "Anthropic",
+        response.status,
+        body,
+        response.headers.get("retry-after"),
       );
     }
 
@@ -202,8 +208,26 @@ export class AnthropicProvider implements Provider {
       const type = payload.type;
 
       if (type === "error") {
-        const error = payload.error as { message?: string } | undefined;
-        throw new Error(error?.message ?? "Anthropic stream error");
+        const error = payload.error as
+          | { type?: string; message?: string }
+          | undefined;
+        const message = error?.message ?? "Anthropic stream error";
+        const kind = error?.type ?? "";
+        if (kind.includes("rate_limit")) {
+          throw new ProviderError(message, {
+            kind: "rate_limited",
+            retryable: true,
+            status: 429,
+          });
+        }
+        if (kind.includes("overloaded") || kind.includes("api_error")) {
+          throw new ProviderError(message, {
+            kind: "server",
+            retryable: true,
+            status: 529,
+          });
+        }
+        throw classifyProviderError(new Error(message));
       }
 
       if (type === "message_start") {

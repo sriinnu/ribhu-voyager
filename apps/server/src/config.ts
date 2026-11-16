@@ -2,7 +2,13 @@ import { randomBytes } from "node:crypto";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { ApprovalsMode, ModelPricing } from "@ribhu-voyager/engine";
+import type {
+  ApprovalsMode,
+  ModelPricing,
+  RetryPolicy as ProviderRetryPolicy,
+} from "@ribhu-voyager/engine";
+
+export type ProviderRetryConfig = Partial<ProviderRetryPolicy>;
 
 export type Config = {
   host: string;
@@ -39,6 +45,18 @@ export type Config = {
   costMicrosPer1kTokens?: number;
   /** Per-model pricing (`provider/model` -> micros per 1k tokens). */
   modelPricing?: Record<string, ModelPricing>;
+  /** Provider retry/timeout policy (env: RIBBHU_PROVIDER_*). */
+  providerRetry?: ProviderRetryConfig;
+  /** Total provider attempts including the first (default 4). */
+  providerMaxAttempts?: number;
+  /** Per-attempt provider request timeout in ms (default 120000). */
+  providerTimeoutMs?: number;
+  /** First backoff delay in ms (default 500). */
+  providerRetryBaseMs?: number;
+  /** Backoff cap in ms (default 30000). */
+  providerRetryMaxMs?: number;
+  /** Backoff jitter fraction 0…1 (default 0.25). */
+  providerRetryJitter?: number;
   /** Max tokens a single run may consume (per-run budget). */
   runTokenBudget?: number;
   /** Max cost in micros a single run may spend; 0 disables the cap. */
@@ -66,6 +84,13 @@ export type Config = {
    * without bound; existing tenants keep working.
    */
   maxTenantRuntimes?: number;
+  /**
+   * R6: evict a tenant runtime once it has no WebSocket clients for this many
+   * milliseconds. Default 600000 (10m); 0 disables eviction entirely.
+   */
+  tenantRuntimeTtlMs?: number;
+  /** R6: background idle-eviction sweep interval. Default 60000; 0 = no timer. */
+  tenantEvictIntervalMs?: number;
   /** True when startup generated a token instead of reading RIBBHU_TOKEN. */
   tokenGenerated?: boolean;
 };
@@ -79,6 +104,32 @@ function parseNonNegativeInt(
   const value = Number(raw);
   if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
     throw new Error(`${name} must be a non-negative integer.`);
+  }
+  return value;
+}
+
+function parsePositiveInt(
+  raw: string | undefined,
+  name: string,
+  fallback: number,
+): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return value;
+}
+
+function parseFraction(
+  raw: string | undefined,
+  name: string,
+  fallback: number,
+): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`${name} must be a number between 0 and 1.`);
   }
   return value;
 }
@@ -279,6 +330,46 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   );
   const migrateOnly = env.RIBBHU_MIGRATE_ONLY?.trim() === "1";
 
+  // Provider resilience (retry/backoff/timeout). One attempt disables retries.
+  const providerMaxAttempts = parsePositiveInt(
+    env.RIBBHU_PROVIDER_MAX_ATTEMPTS,
+    "RIBBHU_PROVIDER_MAX_ATTEMPTS",
+    4,
+  );
+  const providerTimeoutMs = parsePositiveInt(
+    env.RIBBHU_PROVIDER_TIMEOUT_MS,
+    "RIBBHU_PROVIDER_TIMEOUT_MS",
+    120_000,
+  );
+  const providerRetryBaseMs = parseNonNegativeInt(
+    env.RIBBHU_PROVIDER_RETRY_BASE_MS,
+    "RIBBHU_PROVIDER_RETRY_BASE_MS",
+    500,
+  );
+  const providerRetryMaxMs = parseNonNegativeInt(
+    env.RIBBHU_PROVIDER_RETRY_MAX_MS,
+    "RIBBHU_PROVIDER_RETRY_MAX_MS",
+    30_000,
+  );
+  if (providerRetryMaxMs < providerRetryBaseMs) {
+    throw new Error(
+      "RIBBHU_PROVIDER_RETRY_MAX_MS must be >= RIBBHU_PROVIDER_RETRY_BASE_MS.",
+    );
+  }
+  const providerRetryJitter = parseFraction(
+    env.RIBBHU_PROVIDER_RETRY_JITTER,
+    "RIBBHU_PROVIDER_RETRY_JITTER",
+    0.25,
+  );
+  const providerRetry: ProviderRetryConfig = {
+    maxAttempts: providerMaxAttempts,
+    initialDelayMs: providerRetryBaseMs,
+    maxDelayMs: providerRetryMaxMs,
+    factor: 2,
+    jitter: providerRetryJitter,
+    timeoutMs: providerTimeoutMs,
+  };
+
   const sandboxRaw = env.RIBBHU_SANDBOX?.trim().toLowerCase() || "local";
   if (sandboxRaw !== "local" && sandboxRaw !== "docker") {
     throw new Error(
@@ -351,6 +442,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const rateLimitPerMinute = parseRateLimit(env);
   const maxTenantRuntimes = parseMaxTenantRuntimes(env);
+  const tenantRuntimeTtlMs = parseNonNegativeInt(
+    env.RIBBHU_TENANT_RUNTIME_TTL_MS?.trim(),
+    "RIBBHU_TENANT_RUNTIME_TTL_MS",
+    600_000,
+  );
+  const tenantEvictIntervalMs = parseNonNegativeInt(
+    env.RIBBHU_TENANT_EVICT_INTERVAL_MS?.trim(),
+    "RIBBHU_TENANT_EVICT_INTERVAL_MS",
+    60_000,
+  );
 
   return {
     host,
@@ -371,6 +472,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     rateLimitPerMinute,
     pushAllowedHosts,
     maxTenantRuntimes,
+    tenantRuntimeTtlMs,
+    tenantEvictIntervalMs,
     authMode,
     authSource,
     storage: storageRaw,
@@ -396,6 +499,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     runTokenBudget,
     runCostMicros,
     migrateOnly,
+    providerRetry,
+    providerMaxAttempts,
+    providerTimeoutMs,
+    providerRetryBaseMs,
+    providerRetryMaxMs,
+    providerRetryJitter,
   };
 }
 
@@ -419,6 +528,15 @@ export function describeConfig(config: Config): string {
     `  origins   ${config.allowedOrigins?.length ? config.allowedOrigins.join(", ") : "same-origin only"}`,
     `  rate      ${config.rateLimitPerMinute ? `${config.rateLimitPerMinute}/min per IP or token` : "disabled"}`,
     `  tenants   ${config.maxTenantRuntimes && config.maxTenantRuntimes > 0 ? `cap ${config.maxTenantRuntimes} API runtimes (one worker per tenant)` : "API runtime cap unlimited (RIBBHU_MAX_TENANT_RUNTIMES=0)"}`,
+    `  eviction  ${
+      config.tenantRuntimeTtlMs === 0
+        ? "disabled (RIBBHU_TENANT_RUNTIME_TTL_MS=0)"
+        : `idle ${(config.tenantRuntimeTtlMs ?? 600_000) / 1000}s → close${
+            config.tenantEvictIntervalMs === 0
+              ? " (no background sweep)"
+              : `; sweep ${(config.tenantEvictIntervalMs ?? 60_000) / 1000}s`
+          }`
+    }`,
     `  posture   ${config.allowUnsafeHosted ? "break-glass (RIBBHU_ALLOW_UNSAFE_HOSTED=1)" : "hardened"}${config.strictRls ? " · strict RLS" : ""}`,
     `  push      ${config.vapidPublicKey ? "Web Push enabled" : "disabled (set RIBBHU_VAPID_*)"}`,
     `  admin     ${config.adminToken ? "enabled at /admin" : "disabled (set RIBBHU_ADMIN_TOKEN)"}`,
@@ -430,6 +548,7 @@ export function describeConfig(config: Config): string {
           : "unset (usage cost recorded as 0)"
     }`,
     `  budget    ${config.runTokenBudget} tokens/run${config.runCostMicros ? `, ${config.runCostMicros} micros/run cap` : ", no cost cap"}`,
+    `  retries   ${config.providerMaxAttempts ?? 4} attempts · ${config.providerTimeoutMs ?? 120_000}ms timeout · ${config.providerRetryBaseMs ?? 500}-${config.providerRetryMaxMs ?? 30_000}ms backoff`,
     `  migrate   ${config.migrateOnly ? "migrate-only (schema admin)" : "verify-only (no DDL from app)"}`,
   ];
   return lines.join("\n");

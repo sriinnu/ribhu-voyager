@@ -31,6 +31,8 @@ type Client = {
   /** Rate-limit key material captured at upgrade time. */
   ip?: string;
   token?: string;
+  /** True once a runtime lifecycle hook owns this connection. */
+  hooked?: boolean;
 };
 
 type Live = {
@@ -210,7 +212,27 @@ export type GatewayOptions = {
   allowedOrigins?: string[];
   /** R8: per-IP upgrade + per-token submit rate limit; `false` disables. */
   rateLimit?: RateLimitOptions | false;
+  /**
+   * R6: called once per WebSocket connection when its tenant runtime is
+   * reserved (the upgrade token resolved). If the handshake then fails, the
+   * matching `onRuntimeDisconnect` runs immediately so pool counts never leak.
+   * Index wires this to `RuntimePool.acquire`.
+   */
+  onRuntimeConnect?: (
+    runtime: GatewayRuntime,
+    token?: string,
+  ) => void | Promise<void>;
+  /**
+   * R6: called exactly once when the connection ends (close, error,
+   * terminate, failed upgrade, or server shutdown). Index wires this to
+   * `RuntimePool.release`.
+   */
+  onRuntimeDisconnect?: (runtime: GatewayRuntime) => void | Promise<void>;
 };
+
+function logHookError(message: string, error: unknown): void {
+  console.error(message, error);
+}
 
 export function attachGateway(
   server: HttpServer,
@@ -288,6 +310,16 @@ export function attachGateway(
   if (!options.resolveRuntime && (!defaultRuntime || !defaultInfo)) {
     throw new Error(
       "attachGateway needs a runtime and ServerInfo (or a resolveRuntime/infoFor pair).",
+    );
+  }
+
+  // R6: a lifecycle hook pair must be balanced, or active-client counts leak.
+  if (
+    (options.onRuntimeConnect === undefined) !==
+    (options.onRuntimeDisconnect === undefined)
+  ) {
+    throw new Error(
+      "attachGateway requires both onRuntimeConnect and onRuntimeDisconnect, or neither.",
     );
   }
 
@@ -967,6 +999,9 @@ export function attachGateway(
       socket,
       alive: true,
       runtime: clientRuntime,
+      hooked:
+        options.onRuntimeConnect !== undefined ||
+        options.onRuntimeDisconnect !== undefined,
       ...(meta.ip ? { ip: meta.ip } : {}),
       ...(meta.token ? { token: meta.token } : {}),
     };
@@ -997,15 +1032,25 @@ export function attachGateway(
       });
     });
 
-    socket.on("close", () => {
-      detach(client);
-      clients.delete(client);
-    });
+    socket.on("close", () => finishClient(client));
+    socket.on("error", () => finishClient(client));
+  };
 
-    socket.on("error", () => {
-      detach(client);
-      clients.delete(client);
-    });
+  /** Run the disconnect hook once, then detach the client. */
+  const finishClient = (client: Client) => {
+    if (client.hooked) {
+      client.hooked = false;
+      const runtime = client.runtime;
+      try {
+        void Promise.resolve(options.onRuntimeDisconnect?.(runtime)).catch(
+          (error) => logHookError("runtime disconnect hook failed", error),
+        );
+      } catch (error) {
+        logHookError("runtime disconnect hook failed", error);
+      }
+    }
+    detach(client);
+    clients.delete(client);
   };
 
   server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
@@ -1021,6 +1066,22 @@ export function attachGateway(
       return;
     }
     void (async () => {
+      let hookRuntime: GatewayRuntime | undefined;
+      let handedOff = false;
+      let released = false;
+      const releaseFailedUpgrade = () => {
+        if (handedOff || released || hookRuntime === undefined) return;
+        released = true;
+        const runtime = hookRuntime;
+        hookRuntime = undefined;
+        try {
+          void Promise.resolve(options.onRuntimeDisconnect?.(runtime)).catch(
+            (error) => logHookError("runtime disconnect hook failed", error),
+          );
+        } catch (error) {
+          logHookError("runtime disconnect hook failed", error);
+        }
+      };
       try {
         // R1: no drive-by browser control — reject cross-site origins first.
         if (!originAllowed(request, allowedOrigins)) {
@@ -1056,10 +1117,22 @@ export function attachGateway(
           socket.destroy();
           return;
         }
+        // R6: reserve/count the runtime before the handshake completes; the
+        // close/error listeners and catch below release it if the connection
+        // never becomes a client.
+        hookRuntime = resolved;
+        await options.onRuntimeConnect?.(resolved, candidate);
+        socket.once("close", releaseFailedUpgrade);
+        socket.once("error", releaseFailedUpgrade);
         wss.handleUpgrade(request, socket, head, (ws) => {
-          startClient(ws, resolved, { ip, ...(candidate ? { token: candidate } : {}) });
+          handedOff = true;
+          startClient(ws, resolved, {
+            ip,
+            ...(candidate ? { token: candidate } : {}),
+          });
         });
       } catch (error) {
+        releaseFailedUpgrade();
         console.error("auth check failed", error);
         socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
         socket.destroy();
@@ -1099,8 +1172,7 @@ export function attachGateway(
     for (const client of clients) {
       if (!client.alive) {
         client.socket.terminate();
-        clients.delete(client);
-        detach(client);
+        finishClient(client);
         continue;
       }
       client.alive = false;

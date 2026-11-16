@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
+import { connect as netConnect } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -19,7 +20,11 @@ import {
   type GatewayRuntime,
 } from "../src/api-runtime.js";
 import { loadConfig, type Config } from "../src/config.js";
-import { attachGateway, type Gateway } from "../src/gateway.js";
+import {
+  attachGateway,
+  type Gateway,
+  type GatewayOptions,
+} from "../src/gateway.js";
 import { healthResponse } from "../src/health.js";
 import { startWorker } from "../src/worker.js";
 import {
@@ -71,8 +76,10 @@ function expectCapacity(value: RuntimeResolveResult): RuntimeCapacityExceeded {
 function createPoolFor(
   baseDir: string,
   tenantDirs: Map<string, string>,
-  maxTenantRuntimes?: number,
+  options: number | Partial<Config> = {},
 ): RuntimePool {
+  const extra =
+    typeof options === "number" ? { maxTenantRuntimes: options } : options;
   const factory: ApiRuntimeFactory = async (tenantConfig, tenantId) => {
     const dir = tenantDirs.get(tenantId);
     if (!dir) throw new Error(`no data dir for tenant ${tenantId}`);
@@ -82,7 +89,54 @@ function createPoolFor(
     );
   };
   return createRuntimePool(
-    { ...configFor(baseDir), maxTenantRuntimes } as Config,
+    { ...configFor(baseDir), ...extra } as Config,
+    async (token) =>
+      token.startsWith("token-") ? token.slice("token-".length) : undefined,
+    factory,
+  );
+}
+
+type FakeRuntime = ApiRuntime & { closed: boolean };
+
+/** Lightweight runtimes for eviction tests: only close() is observed. */
+function fakeRuntimeFactory(): {
+  runtimes: Map<string, FakeRuntime>;
+  factory: ApiRuntimeFactory;
+} {
+  const runtimes = new Map<string, FakeRuntime>();
+  const factory: ApiRuntimeFactory = async (_config, tenantId) => {
+    const runtime = {
+      serverId: `fake-${tenantId}`,
+      startedAt: Date.now(),
+      demo: true,
+      tenantId,
+      model: { provider: "demo", modelId: "ribhu-demo" },
+      storage: {},
+      closed: false,
+      authInfo: async () => undefined,
+      close: async () => {
+        runtime.closed = true;
+      },
+      conversation: async () => undefined,
+    } as unknown as FakeRuntime;
+    runtimes.set(tenantId, runtime);
+    return runtime;
+  };
+  return { runtimes, factory };
+}
+
+function createFakePool(
+  baseDir: string,
+  factory: ApiRuntimeFactory,
+  extra: Partial<Config> = {},
+): RuntimePool {
+  return createRuntimePool(
+    {
+      ...configFor(baseDir),
+      tenantRuntimeTtlMs: 600_000,
+      tenantEvictIntervalMs: 0,
+      ...extra,
+    } as Config,
     async (token) =>
       token.startsWith("token-") ? token.slice("token-".length) : undefined,
     factory,
@@ -160,6 +214,7 @@ class TestClient {
 
 async function startGateway(
   resolveRuntime: (token: string | undefined) => Promise<GatewayRuntime | undefined>,
+  extra: Partial<GatewayOptions> = {},
 ): Promise<{ port: number; gateway: Gateway; server: Server }> {
   const server = createServer((_request, response) => {
     response.writeHead(404).end();
@@ -173,6 +228,7 @@ async function startGateway(
     {
       resolveRuntime,
       infoFor: (runtime) => runtimeInfo(runtime as ApiRuntime),
+      ...extra,
     },
   );
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -431,8 +487,12 @@ test("R6: pool caps new tenants but keeps serving existing ones", { timeout: 20_
     assert.deepEqual(pool.stats(), {
       activeTenants: 2,
       pendingTenants: 0,
+      activeClients: 0,
+      idle: 2,
+      evictable: 0,
       maxTenants: 2,
       unlimited: false,
+      ttlMs: 600_000,
       tenants: ["tenant-a", "tenant-b"],
     });
 
@@ -462,8 +522,12 @@ test("R6: maxTenantRuntimes=0 means unlimited", { timeout: 20_000 }, async () =>
     assert.deepEqual(pool.stats(), {
       activeTenants: 3,
       pendingTenants: 0,
+      activeClients: 0,
+      idle: 3,
+      evictable: 0,
       maxTenants: 0,
       unlimited: true,
+      ttlMs: 600_000,
       tenants: ["tenant-a", "tenant-b", "tenant-c"],
     });
   } finally {
@@ -502,8 +566,12 @@ test("R6: health returns 503 with pool stats when capacity is exhausted", { time
     assert.deepEqual(healthy.payload.pool, {
       activeTenants: 1,
       pendingTenants: 0,
+      activeClients: 0,
+      idle: 1,
+      evictable: 0,
       maxTenants: 1,
       unlimited: false,
+      ttlMs: 600_000,
       tenants: ["tenant-a"],
     });
 
@@ -587,5 +655,249 @@ test("R6: worker validates and logs its single tenant", { timeout: 20_000 }, asy
     }
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Send an upgrade request that is missing Sec-WebSocket-Key, so ws aborts it. */
+function rawUpgrade(port: number): Promise<void> {
+  return new Promise((resolve) => {
+    const socket = netConnect(port, "127.0.0.1", () => {
+      socket.write(
+        "GET /ws?token=good HTTP/1.1\r\n" +
+          `Host: 127.0.0.1:${port}\r\n` +
+          "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+      );
+    });
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve();
+    };
+    socket.on("close", done);
+    socket.on("error", done);
+    socket.on("data", () => undefined);
+    setTimeout(done, 2_000);
+  });
+}
+
+test("R6: tenant eviction env defaults and validation", () => {
+  const defaults = loadConfig({});
+  assert.equal(defaults.tenantRuntimeTtlMs, 600_000);
+  assert.equal(defaults.tenantEvictIntervalMs, 60_000);
+
+  assert.equal(
+    loadConfig({ RIBBHU_TENANT_RUNTIME_TTL_MS: "0" }).tenantRuntimeTtlMs,
+    0,
+  );
+  assert.equal(
+    loadConfig({ RIBBHU_TENANT_EVICT_INTERVAL_MS: "0" }).tenantEvictIntervalMs,
+    0,
+  );
+  assert.throws(
+    () => loadConfig({ RIBBHU_TENANT_RUNTIME_TTL_MS: "-1" }),
+    /RIBBHU_TENANT_RUNTIME_TTL_MS must be a non-negative integer/,
+  );
+  assert.throws(
+    () => loadConfig({ RIBBHU_TENANT_EVICT_INTERVAL_MS: "1.5" }),
+    /RIBBHU_TENANT_EVICT_INTERVAL_MS must be a non-negative integer/,
+  );
+});
+
+test("R6: acquire/release tracks active clients and clamps release", { timeout: 20_000 }, async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "ribhu-evict-acquire-"));
+  const { runtimes, factory } = fakeRuntimeFactory();
+  const pool = createFakePool(baseDir, factory);
+  try {
+    const a = expectResolved(await pool.acquire("token-tenant-a"));
+    const b = expectResolved(await pool.acquire("token-tenant-b"));
+    assert.equal(runtimes.get("tenant-a"), a.runtime);
+
+    let stats = pool.stats();
+    assert.equal(stats.activeTenants, 2);
+    assert.equal(stats.activeClients, 2);
+    assert.equal(stats.idle, 0);
+    assert.equal(stats.evictable, 0);
+    assert.equal(stats.ttlMs, 600_000);
+
+    pool.release(a.runtime);
+    stats = pool.stats();
+    assert.equal(stats.activeClients, 1);
+    assert.equal(stats.idle, 1);
+
+    // Never underflow: releasing twice must not steal another client's slot.
+    pool.release(a.runtime);
+    assert.equal(pool.stats().activeClients, 1);
+
+    pool.release(b.runtime);
+    assert.equal(pool.stats().activeClients, 0);
+    assert.equal(pool.stats().idle, 2);
+
+    // Unknown runtimes are ignored.
+    pool.release({} as ApiRuntime);
+    assert.equal(pool.stats().activeClients, 0);
+  } finally {
+    await pool.close();
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test("R6: idle eviction closes only idle runtimes; active ones survive", { timeout: 20_000 }, async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "ribhu-evict-idle-"));
+  const { runtimes, factory } = fakeRuntimeFactory();
+  const pool = createFakePool(baseDir, factory, {
+    tenantRuntimeTtlMs: 10,
+    tenantEvictIntervalMs: 0,
+    maxTenantRuntimes: 5,
+  });
+  try {
+    const active = expectResolved(await pool.acquire("token-tenant-a"));
+    const idle = expectResolved(await pool.acquire("token-tenant-b"));
+    pool.release(idle.runtime);
+    await sleep(30);
+
+    assert.equal(pool.stats().evictable, 1);
+    assert.equal(pool.stats().activeClients, 1);
+
+    const evicted = await pool.evictIdle(Date.now());
+    assert.deepEqual(evicted, ["tenant-b"]);
+    assert.equal(runtimes.get("tenant-b")!.closed, true);
+    assert.equal(runtimes.get("tenant-a")!.closed, false, "active runtime survives");
+    assert.deepEqual(pool.stats().tenants, ["tenant-a"]);
+
+    pool.release(active.runtime);
+    await sleep(30);
+    const later = await pool.evictIdle(Date.now());
+    assert.deepEqual(later, ["tenant-a"]);
+    assert.equal(runtimes.get("tenant-a")!.closed, true);
+    assert.equal(pool.stats().activeTenants, 0);
+  } finally {
+    await pool.close();
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test("R6: capacity pressure evicts the least-recently-used idle runtime", { timeout: 20_000 }, async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "ribhu-evict-lru-"));
+  const { runtimes, factory } = fakeRuntimeFactory();
+  const pool = createFakePool(baseDir, factory, {
+    maxTenantRuntimes: 2,
+    tenantRuntimeTtlMs: 10,
+    tenantEvictIntervalMs: 0,
+  });
+  try {
+    const a = expectResolved(await pool.acquire("token-tenant-a"));
+    pool.release(a.runtime);
+    await sleep(15);
+    const b = expectResolved(await pool.acquire("token-tenant-b"));
+    pool.release(b.runtime);
+    await sleep(20);
+
+    // tenant-a is the LRU idle runtime, so it is reclaimed for tenant-c.
+    const c = expectResolved(await pool.resolve("token-tenant-c"));
+    assert.equal(runtimes.get("tenant-a")!.closed, true);
+    assert.equal(runtimes.get("tenant-b")!.closed, false);
+    assert.equal(runtimes.get("tenant-c"), c.runtime);
+    assert.deepEqual(pool.stats().tenants, ["tenant-b", "tenant-c"]);
+  } finally {
+    await pool.close();
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test("R6: no evictable runtime still returns the capacity error", { timeout: 20_000 }, async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "ribhu-evict-none-"));
+  const { runtimes, factory } = fakeRuntimeFactory();
+  const pool = createFakePool(baseDir, factory, {
+    maxTenantRuntimes: 1,
+    tenantRuntimeTtlMs: 600_000,
+    tenantEvictIntervalMs: 0,
+  });
+  try {
+    const a = expectResolved(await pool.acquire("token-tenant-a"));
+    expectCapacity(await pool.resolve("token-tenant-b"));
+    pool.release(a.runtime); // idle but nowhere near the TTL
+    assert.equal(pool.stats().evictable, 0);
+    const refused = expectCapacity(await pool.resolve("token-tenant-b"));
+    assert.equal(refused.limit, 1);
+    assert.equal(runtimes.get("tenant-b"), undefined, "no runtime was created");
+  } finally {
+    await pool.close();
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test("R6: the periodic sweep evicts expired idle runtimes and stops on close", { timeout: 20_000 }, async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "ribhu-evict-timer-"));
+  const { runtimes, factory } = fakeRuntimeFactory();
+  const pool = createFakePool(baseDir, factory, {
+    tenantRuntimeTtlMs: 5,
+    tenantEvictIntervalMs: 10,
+    maxTenantRuntimes: 5,
+  });
+  try {
+    const a = expectResolved(await pool.acquire("token-tenant-a"));
+    pool.release(a.runtime);
+    await waitFor(async () =>
+      runtimes.get("tenant-a")?.closed === true ? true : undefined,
+    );
+    assert.equal(pool.stats().activeTenants, 0);
+  } finally {
+    await pool.close();
+    // close() cleared the timer; a manual sweep afterwards is a safe no-op.
+    assert.deepEqual(await pool.evictIdle(), []);
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test("R6: gateway hooks fire once per connection and release failed upgrades", { timeout: 30_000 }, async () => {
+  const runtime = {
+    serverId: "fake-hooks",
+    conversation: async () => undefined,
+  } as unknown as GatewayRuntime;
+  const connects: Array<{ runtime: GatewayRuntime; token?: string }> = [];
+  const disconnects: GatewayRuntime[] = [];
+  const { port, gateway, server } = await startGateway(
+    async (token) => (token === "good" ? runtime : undefined),
+    {
+      onRuntimeConnect: (target, token) => {
+        connects.push({ runtime: target, token });
+      },
+      onRuntimeDisconnect: (target) => {
+        disconnects.push(target);
+      },
+    },
+  );
+  const client = new TestClient(port, "good");
+  try {
+    await client.open();
+    await waitFor(async () => (connects.length === 1 ? true : undefined));
+    assert.equal(connects[0]!.runtime, runtime);
+    assert.equal(connects[0]!.token, "good");
+
+    // Rejected token never invokes the lifecycle hooks.
+    const bad = new TestClient(port, "bad");
+    await assert.rejects(bad.open(), /401|Unexpected server response/);
+    bad.close();
+    assert.equal(connects.length, 1);
+    assert.equal(disconnects.length, 0);
+
+    // A handshake that never completes must release its reserved runtime.
+    await rawUpgrade(port);
+    await waitFor(async () => (disconnects.length === 1 ? true : undefined));
+    assert.equal(disconnects[0], runtime);
+
+    // Normal close releases exactly once (no double-release on close/error).
+    client.close();
+    await waitFor(async () => (disconnects.length === 2 ? true : undefined));
+    await sleep(50);
+    assert.equal(disconnects.length, 2);
+  } finally {
+    client.close();
+    await gateway.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });

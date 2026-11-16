@@ -55,12 +55,34 @@ cache is bounded:
 - A token for a *new* tenant past the cap is refused with HTTP **503** (`capacity_exceeded`) on both
   the WebSocket upgrade and `/api/health`; already-resolved tenants keep working, and their clients
   are unaffected.
-- Authenticated health includes `pool: {activeTenants, pendingTenants, maxTenants, unlimited,
-  tenants}`; startup prints the configured cap.
+- Authenticated health includes `pool: {activeTenants, pendingTenants, activeClients, idle,
+  evictable, maxTenants, unlimited, ttlMs, tenants}`; startup prints the cap and eviction policy.
+
+### Client-aware idle eviction
+
+Each tenant runtime tracks `activeClients` (WebSocket connections) and `lastUsedAt`. A runtime is
+evicted (closed and removed) only when it has **zero active clients** and has been idle longer than
+the TTL; active and in-flight/pending runtimes are never evicted. Eviction is what makes the cap
+sustainable for many short-lived tenants:
+
+- `RIBBHU_TENANT_RUNTIME_TTL_MS` — idle TTL in milliseconds, default **600000** (10 minutes);
+  `0` disables eviction entirely (the cap then behaves as a hard distinct-tenant limit until restart).
+- `RIBBHU_TENANT_EVICT_INTERVAL_MS` — background sweep interval, default **60000** (1 minute);
+  `0` disables the periodic sweep (capacity-pressure eviction still runs).
+- On capacity pressure (a new tenant arrives at `RIBBHU_MAX_TENANT_RUNTIMES`), the
+  **least-recently-used idle+expired** runtime is evicted first; if none is evictable the new tenant
+  still gets HTTP **503** (`capacity_exceeded`) on the WS upgrade and `/api/health`. Existing tenants
+  always resolve.
+- The gateway reserves its tenant runtime when the upgrade token resolves and releases it on
+  close/error/terminate; a handshake that never completes is released immediately, so `activeClients`
+  never leaks.
+- The active-client guarantee: a tenant that has a live WebSocket is never evicted, no matter how
+  long it has been connected or idle.
 
 This is the deliberate safe design: bounded resources with an explicit failure mode, not a
-rewrite. The residual limitation is that tenant count per API process is capped (raise the env or run
-more API processes); nothing multiplexes tenants inside one runtime.
+rewrite. The residual limitation is that tenant runtimes are still per tenant (no multiplexing
+inside one runtime) and the cap is per API process; the eviction TTL only reclaims completely idle
+tenants.
 
 ## Isolation guarantees
 
@@ -78,5 +100,7 @@ more API processes); nothing multiplexes tenants inside one runtime.
 - The API process holds one runtime per active tenant up to `RIBBHU_MAX_TENANT_RUNTIMES`; capacity
   planning is per process.
 - **Residual limitation (R6):** true per-request shared-pool tenancy is not implemented. Each
-  tenant still gets its own runtime/storage pool (and its own worker); the cap only bounds the number
-  of cached runtimes. Plan one worker per tenant; this is not a shared worker pool or autoscaler.
+  tenant still gets its own runtime/storage pool (and its own worker); eviction only reclaims
+  fully idle tenants past the TTL, so a burst of many distinct tenants can still hit the 503 cap
+  until idle runtimes expire. Plan one worker per tenant; this is not a shared worker pool or
+  autoscaler.

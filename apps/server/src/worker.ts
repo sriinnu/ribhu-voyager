@@ -142,6 +142,7 @@ export async function startWorker(
     ),
     tokenBudget: config.runTokenBudget ?? DEFAULT_RUN_TOKEN_BUDGET,
     costBudgetMicros: config.runCostMicros ?? 0,
+    ...(config.providerRetry ? { providerRetry: config.providerRetry } : {}),
     onApprovalRequest: (conversationId, request) =>
       push.notify({ conversationId, ...request }),
     autoRun: false,

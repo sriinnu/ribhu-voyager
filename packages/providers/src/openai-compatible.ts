@@ -1,10 +1,13 @@
-import type {
-  JsonObject,
-  ModelMessage,
-  Provider,
-  ProviderEvent,
-  ProviderRequest,
-  Usage,
+import {
+  ProviderError,
+  classifyProviderError,
+  providerHttpError,
+  type JsonObject,
+  type ModelMessage,
+  type Provider,
+  type ProviderEvent,
+  type ProviderRequest,
+  type Usage,
 } from "@ribhu-voyager/engine";
 
 export type OpenAICompatOptions = {
@@ -145,8 +148,11 @@ export class OpenAICompatProvider implements Provider {
 
     if (!response.ok) {
       const body = await response.text().catch(() => "");
-      throw new Error(
-        `${this.id} ${response.status} ${response.statusText}: ${body.slice(0, 800)}`,
+      throw providerHttpError(
+        this.id,
+        response.status,
+        body,
+        response.headers.get("retry-after"),
       );
     }
 
@@ -166,8 +172,27 @@ export class OpenAICompatProvider implements Provider {
         continue;
       }
       if (payload.error) {
-        const error = payload.error as { message?: string } | undefined;
-        throw new Error(error?.message ?? `${this.id} stream error`);
+        const error = payload.error as
+          | { message?: string; type?: string; code?: string }
+          | undefined;
+        const message = error?.message ?? `${this.id} stream error`;
+        const kind = `${error?.type ?? ""} ${error?.code ?? ""}`.toLowerCase();
+        if (kind.includes("rate_limit") || kind.includes("rate-limit")) {
+          throw new ProviderError(message, {
+            kind: "rate_limited",
+            retryable: true,
+            status: 429,
+          });
+        }
+        if (kind.includes("overload") || kind.includes("server_error")) {
+          throw new ProviderError(message, {
+            kind: "server",
+            retryable: true,
+            status: 503,
+          });
+        }
+        // e.g. insufficient_quota is permanent (billing), not transient.
+        throw classifyProviderError(new Error(message));
       }
       const choices = payload.choices as
         | Array<{
