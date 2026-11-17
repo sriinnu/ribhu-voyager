@@ -443,6 +443,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 | `RIBBHU_STORAGE` | `sqlite` | `sqlite` or `postgres` |
 | `RIBBHU_POSTGRES_URL` | unset | Postgres URL when storage is `postgres` |
 | `RIBBHU_POSTGRES_POOL_MAX` | `10` | Max connections in the per-URL shared Postgres pool |
+| `RIBBHU_SHARED_WORKER` | unset | `1` (Postgres only): one worker process serves every tenant |
 | `RIBBHU_DEMO` | unset | `1` forces the scripted provider |
 | `RIBBHU_WINDOW_ENTRIES` | `100` | Max transcript entries in a view |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434/v1` | Local Ollama endpoint |
@@ -453,7 +454,7 @@ Postgres full-text (`tsvector`/`ts_headline`) rather than `LIKE`.
 ## Tests and development
 
 ```bash
-npm test          # 154 tests
+npm test          # 157 tests
 npm run typecheck
 npm run build
 npm run dev
@@ -540,8 +541,10 @@ next step. See [docs/ARCHITECTURE-UPGRADE.md](docs/ARCHITECTURE-UPGRADE.md) and 
   pressure reclaims the least-recently-used idle runtime first. Tenant storages share one
   reference-counted `pg.Pool` per URL (bounded by `RIBBHU_POSTGRES_POOL_MAX`, default 10) and set
   `app.tenant_id` per transaction with `SET LOCAL`, so RLS is enforced for every operation outside
-  explicit transactions too. Workers still bind to `RIBBHU_TENANT`, and there is no worker
-  autoscaler or shared worker pool. See [docs/MULTI-TENANT.md](docs/MULTI-TENANT.md).
+  explicit transactions too. Workers run one process per tenant by default (`RIBBHU_TENANT`); on
+  Postgres, `RIBBHU_SHARED_WORKER=1` runs one worker process that discovers tenants and serves each
+  with its own engine/claim loop and `RIBBHU_WORKSPACE/<tenant>` (no autoscaler or multi-process
+  sharding). See [docs/MULTI-TENANT.md](docs/MULTI-TENANT.md).
 - **RLS requires the right role.** A superuser or `BYPASSRLS` role silently bypasses row security.
   Provision a dedicated `NOSUPERUSER NOBYPASSRLS` app role.
 - **Approvals are single-user and non-cryptographic.** `ask` pauses risky tools, survives restart, and

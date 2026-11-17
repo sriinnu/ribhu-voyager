@@ -1,8 +1,9 @@
 # Hosted Single-Tenant Beta
 
-This is the shortest safe path to a hosted Ribhu Voyager: one tenant, one API/worker pair, a
-least-privilege Postgres role, tenant API tokens, and TLS in front. It is **not** a multi-tenant SaaS
-control plane; run one deployment per tenant.
+This is the shortest safe path to a hosted Ribhu Voyager: one tenant per deployment, one API/worker
+pair, a least-privilege Postgres role, tenant API tokens, and TLS in front. For many tenants on one
+Postgres database, the API process can already serve all of them, and the worker can run as a single
+shared multi-tenant process (`RIBBHU_SHARED_WORKER=1`); see [MULTI-TENANT.md](MULTI-TENANT.md).
 
 ## 1. Provision Postgres
 
@@ -93,8 +94,22 @@ npm start
 - The shared `RIBBHU_TOKEN` is ignored when Postgres token checking is active; use the issued token.
 - Keep `HOST=127.0.0.1` and put TLS in front. Do not expose cleartext `0.0.0.0`.
 - `RIBBHU_SANDBOX=docker` and a restrictive approval policy are strongly recommended for hosted use.
-- The API process can serve multiple tenants (see [MULTI-TENANT.md](MULTI-TENANT.md)); run one worker
-  per tenant. There is no worker autoscaler or shared worker pool.
+- The API process can serve multiple tenants (see [MULTI-TENANT.md](MULTI-TENANT.md)). By default run
+  one worker per tenant (`RIBBHU_TENANT=<tenant>`). For a multi-tenant host, opt into one shared
+  worker process instead:
+
+  ```bash
+  RIBBHU_STORAGE=postgres \
+  RIBBHU_POSTGRES_URL="$APP_URL" \
+  RIBBHU_SHARED_WORKER=1 \
+  RIBBHU_WORKSPACE="$HOME/ribhu-workspaces" \
+  RIBBHU_STRICT_RLS=1 RIBBHU_SANDBOX=docker RIBBHU_APPROVALS=deny-bash \
+  npm run start:worker
+  ```
+
+  The shared worker discovers tenants from Postgres, runs one per-tenant engine/claim loop, and uses
+  `RIBBHU_WORKSPACE/<tenant>` for each tenant's tools. There is still no worker autoscaler and a
+  crashed shared worker drains every tenant on that process.
 
 ## 5. TLS reverse proxy
 
@@ -137,6 +152,8 @@ the browser. WebSocket upgrades use the same origin.
 - [ ] Migration completed and counts verified
 - [ ] Backup + restore tested
 - [ ] `RIBBHU_SANDBOX=docker` and approval policy set
+- [ ] Worker topology chosen: one `RIBBHU_TENANT` worker per tenant (default) or
+      `RIBBHU_SHARED_WORKER=1` on Postgres, with `RIBBHU_WORKSPACE` on durable storage
 - [ ] Authenticated health checked from outside the host
 - [ ] Worker-per-tenant topology documented for operators
 

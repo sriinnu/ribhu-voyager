@@ -14,13 +14,17 @@ API (runtime pool) ──▶ tenant-a storage ─┐
    │                           each statement: BEGIN; SET LOCAL app.tenant_id; …; COMMIT
    │
    └── WebSocket / health per token
-Worker A (RIBBHU_TENANT=tenant-a) ──▶ tenant-a jobs   (same shared pool in that process)
-Worker B (RIBBHU_TENANT=tenant-b) ──▶ tenant-b jobs
+
+Default workers:            Shared worker (RIBBHU_SHARED_WORKER=1):
+Worker A (tenant-a)         one process, discovers tenants from Postgres
+Worker B (tenant-b)         ├ tenant-a worker ──▶ tenant-a jobs (workspace/<tenant-a>)
+                            └ tenant-b worker ──▶ tenant-b jobs (workspace/<tenant-b>)
 ```
 
 - One API process can serve many tenants.
-- Run **one worker per tenant**: workers still bind to `RIBBHU_TENANT`. There is no worker
-  autoscaler or cross-tenant job router yet.
+- Workers either run **one process per tenant** (default: each binds `RIBBHU_TENANT`) or, opt-in on
+  Postgres, **one shared worker process for all tenants** (`RIBBHU_SHARED_WORKER=1`). There is no
+  autoscaler; see "Shared multi-tenant worker" below.
 - Postgres must use a `NOSUPERUSER NOBYPASSRLS` role; RLS separates conversations, entries, docs,
   submissions, jobs, tool tasks, settings, cancels, usage events, audit events, and the quota tables.
 
@@ -44,6 +48,47 @@ Tenant isolation is per **transaction**, not per connection pool:
 
 This removes the earlier "one pool per tenant runtime" cost: adding/evicting a tenant runtime no
 longer opens a new pool, and many tenants multiplex over the same bounded connection set.
+
+## Shared multi-tenant worker (Phase 14)
+
+Postgres deployments can run a single worker process for every tenant instead of one process per
+tenant:
+
+```bash
+RIBBHU_STORAGE=postgres \
+RIBBHU_POSTGRES_URL="$APP_URL" \
+RIBBHU_SHARED_WORKER=1 \
+RIBBHU_WORKSPACE=~/ribhu-workspaces \
+npm run start:worker
+```
+
+How it works:
+
+- **Opt-in only.** `RIBBHU_SHARED_WORKER=1` requires `RIBBHU_STORAGE=postgres`; otherwise startup
+  fails with a clear error. Without it, `startWorker`/`worker-main` keep the existing
+  one-worker-per-tenant behavior (and SQLite deployments are unchanged).
+- **Discovery.** At startup the process opens a bootstrap tenant storage (which verifies the schema
+  version, never migrates) and calls `listTenants()`. It creates one `TenantWorker` per tenant and
+  re-checks the tenants table every 60s, adding workers for tenants provisioned later. Discovery
+  count and tenant ids are logged.
+- **Per-tenant worker.** Each `TenantWorker` owns a tenant-scoped storage from the process-wide
+  shared `pg.Pool`, its own `Engine`/`AuthManager`/provider/push notifier, its own per-tenant auth
+  settings, a unique owner id, and the existing per-tenant health keys
+  (`worker_heartbeat:<owner>` / `worker_job:<owner>`, plus the aggregate keys) — all RLS-scoped.
+- **Per-tenant workspace.** Tools run in `RIBBHU_WORKSPACE/<tenant>` (created on demand) so file
+  output from one tenant never lands in another tenant's project.
+- **Concurrency and fairness.** Each tenant has an independent claim loop: at most one active job
+  per tenant/conversation, but a slow tenant (long tool, slow model, blocked approval) never blocks
+  another tenant's jobs. Quotas, leases/fences, cancel flags and approvals all work per tenant.
+- **Shutdown.** `SIGINT`/`SIGTERM` aborts in-flight tenant runs, drains each tenant loop, closes all
+  engines/storages and releases shared-pool references; the pool ends with the last tenant. Closing
+  one tenant's storage never ends the pool for the others.
+- **Failure containment.** A tenant worker that fails to initialize is logged and skipped; the
+  remaining tenants keep running. A full process crash still stops all tenants on that host.
+
+Remaining limits: one shared worker is still a single process (no autoscaler or multi-process
+sharding), every tenant has an in-process Engine, and a crashed shared worker drains all tenants on
+that process until restarted. The default one-worker-per-tenant deployment remains supported.
 
 ## Tokens
 
@@ -117,12 +162,15 @@ tenants.
 ## Limits
 
 - No tenant provisioning/admin API, per-tenant quotas, billing, or audit dashboard.
-- Workers are deployed per tenant; no shared worker pool or autoscaler.
+- Workers run one process per tenant by default; Postgres deployments may opt into one shared
+  multi-tenant worker process (`RIBBHU_SHARED_WORKER=1`), but there is still no autoscaler or
+  multi-process sharding.
 - No token rotation UI beyond the CLI (`issue` / `revoke`).
 - The API process holds one runtime per active tenant up to `RIBBHU_MAX_TENANT_RUNTIMES`; capacity
   planning is per process. Tenant storage shares one ref-counted pool per URL, so the cap now
   bounds engine/runtime handles, not Postgres connections. Eviction still only reclaims fully idle
   tenants past the TTL, so bursts of many distinct tenants can hit the 503 cap until idle runtimes
   expire.
-- The remaining worker limitation is architectural: jobs are not routed across tenants, so plan one
-  worker process per tenant (each worker has its own shared pool for that process).
+- Worker topology: default is one worker process per tenant; `RIBBHU_SHARED_WORKER=1` gives one
+  process that serves all tenants with per-tenant workers/workspaces. Either way a worker only
+  claims its tenant's jobs (RLS), and there is no cross-host worker pool.

@@ -97,6 +97,11 @@ export type Config = {
   tenantEvictIntervalMs?: number;
   /** Maximum connections in the process-wide shared Postgres pool. Default 10. */
   postgresPoolMax?: number;
+  /**
+   * Phase 14: one shared worker process serves every Postgres tenant
+   * (`RIBBHU_SHARED_WORKER=1`). Default off: one worker per `RIBBHU_TENANT`.
+   */
+  sharedWorker?: boolean;
   /** True when startup generated a token instead of reading RIBBHU_TOKEN. */
   tokenGenerated?: boolean;
 };
@@ -448,6 +453,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   const rateLimitPerMinute = parseRateLimit(env);
   const maxTenantRuntimes = parseMaxTenantRuntimes(env);
+  const sharedWorker = env.RIBBHU_SHARED_WORKER?.trim() === "1";
+  if (sharedWorker && storageRaw !== "postgres") {
+    throw new Error(
+      "RIBBHU_SHARED_WORKER=1 requires RIBBHU_STORAGE=postgres (the shared worker discovers tenants from Postgres).",
+    );
+  }
   const postgresPoolMax = parsePositiveInt(
     env.RIBBHU_POSTGRES_POOL_MAX?.trim(),
     "RIBBHU_POSTGRES_POOL_MAX",
@@ -486,6 +497,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     tenantRuntimeTtlMs,
     tenantEvictIntervalMs,
     postgresPoolMax,
+    sharedWorker,
     authMode,
     authSource,
     storage: storageRaw,
@@ -540,6 +552,7 @@ export function describeConfig(config: Config): string {
     `  origins   ${config.allowedOrigins?.length ? config.allowedOrigins.join(", ") : "same-origin only"}`,
     `  rate      ${config.rateLimitPerMinute ? `${config.rateLimitPerMinute}/min per IP or token` : "disabled"}`,
     `  pool      shared Postgres pool max ${config.postgresPoolMax ?? 10} connections`,
+    `  worker    ${config.sharedWorker ? "shared multi-tenant (RIBBHU_SHARED_WORKER=1)" : "one worker per tenant (RIBBHU_TENANT)"}`,
     `  tenants   ${config.maxTenantRuntimes && config.maxTenantRuntimes > 0 ? `cap ${config.maxTenantRuntimes} API runtimes (one worker per tenant)` : "API runtime cap unlimited (RIBBHU_MAX_TENANT_RUNTIMES=0)"}`,
     `  eviction  ${
       config.tenantRuntimeTtlMs === 0
